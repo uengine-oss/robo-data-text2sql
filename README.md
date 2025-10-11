@@ -1,4 +1,4 @@
-# Neo4j Text2SQL
+# Graph-based Metadata-Augmented Text2SQL
 
 자연어 질의를 받아 Neo4j 기반 RAG로 안전한 SQL을 생성·실행하고, 표와 차트로 결과를 반환하는 시스템입니다.
 
