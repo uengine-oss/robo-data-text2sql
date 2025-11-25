@@ -18,12 +18,13 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
 from app.config import settings
-from app.react.enrich_react_medata import (
+from app.react.enrich_react_metadata import (
     auto_enrich_tables_from_reasoning
 )
 from app.react.state import ReactMetadata, ReactSessionState, MetadataParseError
 from app.react.tools import ToolContext, ToolExecutionError, execute_tool
 from app.react.utils import XmlUtil
+from app.react.prompts import get_prompt_text
 
 
 class ReactAgentError(Exception):
@@ -32,6 +33,10 @@ class ReactAgentError(Exception):
 
 class LLMResponseFormatError(ReactAgentError):
     """LLM 이 잘못된 XML 포맷을 반환했을 때"""
+
+
+class SQLNotExplainedError(ReactAgentError):
+    """explain 없이 execute_sql_preview 또는 submit_sql이 호출되었을 때"""
 
 
 @dataclass
@@ -68,6 +73,8 @@ class AgentOutcome:
     final_sql_validated: Optional[str] = None
     metadata: ReactMetadata = field(default_factory=ReactMetadata)
     question_to_user: Optional[str] = None
+    was_last_call_submission: bool = False
+    sql_not_explained: bool = False
 
 
 def _to_cdata(value: str) -> str:
@@ -75,8 +82,8 @@ def _to_cdata(value: str) -> str:
 
 
 class ReactAgent:
-    def __init__(self, prompt_path: Path):
-        self.prompt_text = prompt_path.read_text(encoding="utf-8")
+    def __init__(self):
+        self.prompt_text = get_prompt_text("react_prompt.xml")
         self.llm = ChatOpenAI(
             model=settings.react_openai_llm_model,
             temperature=0,
@@ -98,11 +105,15 @@ class ReactAgent:
         user_response 가 주어지면 가장 최근 tool_result 로 전달한다.
         """
         if user_response:
-            state.current_tool_result = (
-                "<tool_result>"
-                f"<user_response>{_to_cdata(user_response)}</user_response>"
-                "</tool_result>"
-            )
+            parts = ["<tool_result>"]
+            if state.pending_agent_question:
+                parts.append(
+                    f"<agent_question>{_to_cdata(state.pending_agent_question)}</agent_question>"
+                )
+                state.pending_agent_question = ""  # Clear after use
+            parts.append(f"<user_response>{_to_cdata(user_response)}</user_response>")
+            parts.append("</tool_result>")
+            state.current_tool_result = "".join(parts)
 
         steps: List[ReactStep] = []
         iteration_limit = max_iterations or (state.remaining_tool_calls + 10)
@@ -141,11 +152,23 @@ class ReactAgent:
 
             if tool_name == "submit_sql":
                 sql_text = step.tool_call.parsed_parameters.get("sql", "")
+                is_last_call = state.remaining_tool_calls <= 1
+                sql_not_explained = not state.is_sql_explained(sql_text)
+                
+                # remaining_tool_calls > 1일 때만 explain 검증
+                if not is_last_call and sql_not_explained:
+                    raise SQLNotExplainedError(
+                        "Before calling submit_sql, you must first validate the SQL with the explain tool. "
+                        "Please call the explain tool first and then try again."
+                    )
+                
                 outcome = AgentOutcome(
                     status="submit_sql",
                     steps=steps,
                     final_sql=sql_text,
                     metadata=state.metadata,
+                    was_last_call_submission=is_last_call,
+                    sql_not_explained=sql_not_explained,
                 )
                 if on_step:
                     await on_step(step, state)
@@ -168,6 +191,15 @@ class ReactAgent:
                     await on_outcome(outcome, state)
                 return outcome
 
+            # execute_sql_preview는 반드시 explain이 선행되어야 함
+            if tool_name == "execute_sql_preview":
+                sql_text = step.tool_call.parsed_parameters.get("sql", "")
+                if not state.is_sql_explained(sql_text):
+                    raise SQLNotExplainedError(
+                        "Before calling execute_sql_preview, you must first validate the SQL with the explain tool. "
+                        "Please call the explain tool first and then try again."
+                    )
+
             # Execute actual tool
             try:
                 tool_result = await execute_tool(
@@ -177,6 +209,13 @@ class ReactAgent:
                 )
             except ToolExecutionError as exc:
                 raise ReactAgentError(str(exc)) from exc
+            
+            # explain 호출 시 SQL을 추적
+            if tool_name == "explain":
+                sql_text = step.tool_call.parsed_parameters.get("sql", "")
+                if sql_text:
+                    state.add_explained_sql(sql_text)
+            
             state.current_tool_result = tool_result
             state.remaining_tool_calls -= 1
 
@@ -211,8 +250,6 @@ class ReactAgent:
                 "outcome": outcome,
                 "state": state_snapshot.to_dict(),
             }
-            if outcome.status == "ask_user":
-                payload["session_token"] = state_snapshot.to_token()
             await queue.put(payload)
 
         async def runner() -> None:
@@ -258,6 +295,8 @@ class ReactAgent:
         parts = ["<input>"]
         parts.append(f"<user_query><![CDATA[{user_query}]]></user_query>")
         parts.append(f"<dbms>{state.dbms}</dbms>")
+        parts.append(f"<max_sql_seconds>{state.max_sql_seconds}</max_sql_seconds>")
+        parts.append(f"<prefer_language>{state.prefer_language}</prefer_language>")
         parts.append(f"<remaining_tool_calls>{state.remaining_tool_calls}</remaining_tool_calls>")
         parts.append("<current_tool_result>")
         parts.append(state.current_tool_result or "<tool_result/>")
@@ -375,7 +414,7 @@ class ReactAgent:
                 "search_keywords": keywords,
             }
 
-        if tool_name in {"execute_sql_preview", "submit_sql"}:
+        if tool_name in {"execute_sql_preview", "submit_sql", "explain"}:
             # parameters element may include nested tags; we take inner text
             sql_text = "".join(parameters_el.itertext()).strip()
             return {"sql": sql_text}

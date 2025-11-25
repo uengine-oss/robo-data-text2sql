@@ -12,6 +12,7 @@ async def execute(
     """
     SQL 예비 실행 툴.
     안전 검증 후 최대 preview_row_limit 개 행만 반환한다.
+    max_sql_seconds 내에 실행되어야 하며, 초과 시 타임아웃 에러를 반환한다.
     """
     guard = SQLGuard()
     executor = SQLExecutor()
@@ -21,7 +22,11 @@ async def execute(
 
     try:
         validated_sql, _ = guard.validate(sql)
-        results = await executor.execute_query(context.db_conn, validated_sql)
+        results = await executor.execute_query(
+            context.db_conn, 
+            validated_sql,
+            timeout=float(context.max_sql_seconds),
+        )
 
         columns = results.get("columns", [])
         rows = results.get("rows", [])

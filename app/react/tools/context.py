@@ -17,12 +17,19 @@ class ToolContext:
     neo4j_session: AsyncSession
     db_conn: asyncpg.Connection
     openai_client: AsyncOpenAI
+
     table_top_k: int = 20
     table_relation_limit: int = 20
     column_relation_limit: int = 10
     value_limit: int = 10
     preview_row_limit: int = 30
     tool_power_level: float = 1.0
+
+    search_table_keyword_limit: int = 10
+    get_table_schema_table_name_limit: int = 10
+    search_column_values_search_keywords_limit: int = 10
+
+    max_sql_seconds: int = 60
 
     def scaled(self, value: int) -> int:
         """TOOL_POWER_LEVEL 을 적용한 정수 값을 반환한다."""
@@ -37,6 +44,10 @@ class ToolContext:
         column_relation_limit: Optional[int] = None,
         value_limit: Optional[int] = None,
         preview_row_limit: Optional[int] = None,
+        search_table_keyword_limit: Optional[int] = None,
+        get_table_schema_table_name_limit: Optional[int] = None,
+        search_column_values_search_keywords_limit: Optional[int] = None,
+        max_sql_seconds: Optional[int] = None,
     ) -> "ToolContext":
         """필요시 일부 파라미터를 오버라이드한 새로운 컨텍스트를 생성한다."""
         return ToolContext(
@@ -49,5 +60,9 @@ class ToolContext:
             value_limit=value_limit or self.value_limit,
             preview_row_limit=preview_row_limit or self.preview_row_limit,
             tool_power_level=self.tool_power_level,
+            search_table_keyword_limit=search_table_keyword_limit or self.search_table_keyword_limit,
+            get_table_schema_table_name_limit=get_table_schema_table_name_limit or self.get_table_schema_table_name_limit,
+            search_column_values_search_keywords_limit=search_column_values_search_keywords_limit or self.search_column_values_search_keywords_limit,
+            max_sql_seconds=max_sql_seconds or self.max_sql_seconds,
         )
 

@@ -21,6 +21,41 @@
             </div>
         </div>
 
+        <!-- 고급 설정 (쿼리 입력 시에만 표시) -->
+        <div v-if="!waitingForUser" class="settings-section">
+            <button class="settings-toggle" type="button" @click="showSettings = !showSettings">
+                <span class="toggle-icon">⚙️</span>
+                <span class="toggle-text">고급 설정</span>
+                <span class="toggle-arrow" :class="{ expanded: showSettings }">▼</span>
+            </button>
+            <transition name="slide">
+                <div v-if="showSettings" class="settings-panel">
+                    <div class="setting-item">
+                        <label for="maxToolCalls">
+                            <span class="setting-label">최대 도구 호출 횟수</span>
+                            <span class="setting-hint">에이전트가 사용할 수 있는 도구 호출 수 (1~100)</span>
+                        </label>
+                        <div class="setting-input-group">
+                            <input id="maxToolCalls" v-model.number="maxToolCalls" type="number" min="1" max="100"
+                                :disabled="loading" />
+                            <span class="setting-unit">회</span>
+                        </div>
+                    </div>
+                    <div class="setting-item">
+                        <label for="maxSqlSeconds">
+                            <span class="setting-label">SQL 실행 제한 시간</span>
+                            <span class="setting-hint">최종 SQL 실행 최대 허용 시간 (1~3600초)</span>
+                        </label>
+                        <div class="setting-input-group">
+                            <input id="maxSqlSeconds" v-model.number="maxSqlSeconds" type="number" min="1" max="3600"
+                                :disabled="loading" />
+                            <span class="setting-unit">초</span>
+                        </div>
+                    </div>
+                </div>
+            </transition>
+        </div>
+
         <div v-else class="follow-up-wrapper">
             <div class="follow-up-question">
                 <strong>에이전트 질문:</strong>
@@ -47,8 +82,13 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 
+export interface ReactStartOptions {
+    maxToolCalls: number
+    maxSqlSeconds: number
+}
+
 const emit = defineEmits<{
-    start: [question: string]
+    start: [question: string, options: ReactStartOptions]
     respond: [answer: string]
     cancel: []
 }>()
@@ -62,6 +102,9 @@ const props = defineProps<{
 
 const question = ref(props.currentQuestion ?? '')
 const userResponse = ref('')
+const showSettings = ref(false)
+const maxToolCalls = ref(30)
+const maxSqlSeconds = ref(60)
 
 const waitingForUser = computed(() => props.waitingForUser)
 
@@ -89,7 +132,10 @@ function submitQuestion() {
     if (!canSubmitQuestion.value) return
     const trimmed = question.value.trim()
     question.value = trimmed
-    emit('start', trimmed)
+    emit('start', trimmed, {
+        maxToolCalls: maxToolCalls.value,
+        maxSqlSeconds: maxSqlSeconds.value
+    })
 }
 
 function submitUserResponse() {
@@ -165,7 +211,7 @@ textarea {
     font-size: 1rem;
     font-family: inherit;
     resize: none;
-    height: 120px;
+    height: 240px;
     transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
     background: #fafbfc;
     line-height: 1.6;
@@ -190,7 +236,20 @@ textarea:disabled {
     gap: 0.75rem;
     align-items: stretch;
     min-width: 150px;
-    height: 120px;
+}
+
+/* 쿼리 입력 시 (버튼 1개) - textarea와 높이 맞춤 */
+.input-container .action-buttons {
+    height: 240px;
+}
+
+/* 후속 질문 시 (버튼 2개) - 더 많은 공간 필요 */
+.follow-up-container .action-buttons {
+    min-height: 120px;
+}
+
+.follow-up-container textarea {
+    min-height: 120px;
 }
 
 .btn-primary {
@@ -318,6 +377,142 @@ textarea:disabled {
     white-space: pre-wrap;
     line-height: 1.6;
     color: #92400e;
+}
+
+/* 고급 설정 섹션 */
+.settings-section {
+    margin-top: 0.5rem;
+}
+
+.settings-toggle {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.6rem 1rem;
+    background: transparent;
+    border: 1px dashed #cbd5e0;
+    border-radius: 8px;
+    color: #718096;
+    font-size: 0.85rem;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    width: 100%;
+    justify-content: center;
+}
+
+.settings-toggle:hover {
+    background: #f7fafc;
+    border-color: #a0aec0;
+    color: #4a5568;
+}
+
+.toggle-icon {
+    font-size: 1rem;
+}
+
+.toggle-text {
+    font-weight: 500;
+}
+
+.toggle-arrow {
+    font-size: 0.7rem;
+    transition: transform 0.2s ease;
+    margin-left: auto;
+}
+
+.toggle-arrow.expanded {
+    transform: rotate(180deg);
+}
+
+.settings-panel {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 1rem;
+    margin-top: 0.75rem;
+    padding: 1.25rem;
+    background: #f8fafc;
+    border: 1px solid #e2e8f0;
+    border-radius: 12px;
+}
+
+.setting-item {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+.setting-item label {
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+}
+
+.setting-label {
+    font-size: 0.9rem;
+    font-weight: 600;
+    color: #2d3748;
+}
+
+.setting-hint {
+    font-size: 0.75rem;
+    color: #718096;
+}
+
+.setting-input-group {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.setting-input-group input {
+    flex: 1;
+    padding: 0.6rem 0.75rem;
+    border: 2px solid #e2e8f0;
+    border-radius: 8px;
+    font-size: 0.9rem;
+    font-family: inherit;
+    transition: all 0.2s ease;
+    background: white;
+    max-width: 120px;
+}
+
+.setting-input-group input:focus {
+    outline: none;
+    border-color: #667eea;
+    box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+}
+
+.setting-input-group input:disabled {
+    background: #edf2f7;
+    cursor: not-allowed;
+    opacity: 0.6;
+}
+
+.setting-unit {
+    font-size: 0.85rem;
+    color: #718096;
+    min-width: 24px;
+}
+
+/* Slide 트랜지션 */
+.slide-enter-active,
+.slide-leave-active {
+    transition: all 0.25s ease;
+    overflow: hidden;
+}
+
+.slide-enter-from,
+.slide-leave-to {
+    opacity: 0;
+    max-height: 0;
+    margin-top: 0;
+    padding: 0 1.25rem;
+}
+
+.slide-enter-to,
+.slide-leave-from {
+    opacity: 1;
+    max-height: 200px;
 }
 
 /* 반응형 디자인 */

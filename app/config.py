@@ -59,6 +59,7 @@ class Settings(BaseSettings):
     delay_after_react_generator_seconds: int = 5
     previous_reasoning_limit_steps: int = 15
     is_add_mocked_db_caution: bool = False
+    explain_analysis_timeout_seconds: int = 10
     
     class Config:
         env_file = ".env"

@@ -19,8 +19,6 @@ from app.react.tools import ToolContext
 
 router = APIRouter(prefix="/react", tags=["ReAct"])
 
-PROMPT_PATH = Path(__file__).resolve().parents[1] / "react" / "prompt.xml"
-
 
 def _to_cdata(value: str) -> str:
     return f"<![CDATA[{value}]]>"
@@ -84,6 +82,12 @@ class ReactRequest(BaseModel):
     step_confirmation_response: Optional[Literal["continue"]] = Field(
         default=None, description="step confirmation 상태에서 재개 응답"
     )
+    max_sql_seconds: int = Field(
+        default=60, ge=1, le=3600, description="SQL 실행 최대 허용 시간(초). 기본값: 60초"
+    )
+    prefer_language: str = Field(
+        default="ko", description="사용자 선호 언어 코드(ko, en, ja, zh 등). 기본값: ko"
+    )
 
 
 def _step_to_model(step: ReactStep) -> ReactStepModel:
@@ -110,6 +114,9 @@ def _step_to_model(step: ReactStep) -> ReactStepModel:
 def _ensure_state_from_request(request: ReactRequest) -> ReactSessionState:
     if request.session_state:
         state = ReactSessionState.from_token(request.session_state)
+        # 세션에서 복원해도 새로운 요청의 max_sql_seconds, prefer_language를 우선 적용
+        state.max_sql_seconds = request.max_sql_seconds
+        state.prefer_language = request.prefer_language
     else:
         dbms = request.dbms or settings.target_db_type
         state = ReactSessionState.new(
@@ -117,6 +124,8 @@ def _ensure_state_from_request(request: ReactRequest) -> ReactSessionState:
             dbms=dbms,
             remaining_tool_calls=request.max_tool_calls,
             step_confirmation_mode=request.step_confirmation_mode or False,
+            max_sql_seconds=request.max_sql_seconds,
+            prefer_language=request.prefer_language,
         )
 
     if request.step_confirmation_mode is not None:
@@ -146,9 +155,10 @@ async def run_react(
         neo4j_session=neo4j_session,
         db_conn=db_conn,
         openai_client=openai_client,
+        max_sql_seconds=state.max_sql_seconds,
     )
 
-    agent = ReactAgent(PROMPT_PATH)
+    agent = ReactAgent()
     warnings: List[str] = []
     steps: List[ReactStepModel] = []
 
@@ -212,12 +222,13 @@ async def run_react(
 
                     if outcome.status == "ask_user":
                         question = outcome.question_to_user or ""
+                        state.pending_agent_question = question
                         state.current_tool_result = (
                             "<tool_result>"
                             f"<ask_user_question>{_to_cdata(question)}</ask_user_question>"
                             "</tool_result>"
                         )
-                        session_token = event.get("session_token") or state.to_token()
+                        session_token = state.to_token()
                         response_payload = ReactResponse(
                             status="needs_user_input",
                             steps=steps,
@@ -245,6 +256,19 @@ async def run_react(
                         return
 
                     final_sql = outcome.final_sql or ""
+                    
+                    # 마지막 호출 제출인 경우 경고 추가
+                    if outcome.was_last_call_submission:
+                        warnings.append(
+                            "남은 도구 호출 횟수가 1 이하여서 SQL이 검증 없이 제출되었습니다. "
+                            "SQL이 실행되지 않으며, 결과는 참고용으로만 사용하세요."
+                        )
+                        if outcome.sql_not_explained:
+                            warnings.append(
+                                "이 SQL은 explain 도구로 사전 검증되지 않았습니다. "
+                                "실행 전에 수동으로 검토하시기 바랍니다."
+                            )
+                    
                     guard = SQLGuard()
                     try:
                         validated_sql, _ = guard.validate(final_sql)
@@ -257,10 +281,15 @@ async def run_react(
                         return
 
                     execution_result = None
-                    if request.execute_final_sql:
+                    # 마지막 호출 제출이 아닐 때만 SQL 실행
+                    if request.execute_final_sql and not outcome.was_last_call_submission:
                         executor = SQLExecutor()
                         try:
-                            raw_result = await executor.execute_query(db_conn, validated_sql)
+                            raw_result = await executor.execute_query(
+                                db_conn, 
+                                validated_sql,
+                                timeout=float(request.max_sql_seconds),
+                            )
                             formatted = executor.format_results_for_json(raw_result)
                             execution_result = ExecutionResultModel(**formatted)
                         except SQLExecutionError as exc:

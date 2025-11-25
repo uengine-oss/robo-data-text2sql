@@ -62,6 +62,7 @@ async def get_table_fk_relationships(
            c1.description AS from_column_description,
            c2.name AS to_column,
            c2.description AS to_column_description
+    ORDER BY t2.name, c1.name, c2.name
     LIMIT $limit
     """
 
@@ -96,6 +97,7 @@ async def get_table_fk_relationships(
                c1.description AS from_column_description,
                c2.name AS to_column,
                c2.description AS to_column_description
+        ORDER BY t2.name, c1.name, c2.name
         LIMIT $limit
         """
 
@@ -122,6 +124,15 @@ async def get_table_fk_relationships(
                 rel_info["to_column_description"] = record["to_column_description"]
             relationships.append(rel_info)
 
+    relationships.sort(
+        key=lambda r: (
+            r.get("related_table_schema") or "",
+            r.get("related_table") or "",
+            r.get("from_column") or "",
+            r.get("to_column") or "",
+            r.get("relation_type") or "",
+        )
+    )
     return relationships
 
 
@@ -148,7 +159,8 @@ async def get_table_any_relationships(
                    END
                )
            ] AS relationship_paths
-           LIMIT 100
+    ORDER BY t2.name
+    LIMIT 100
     """
 
     result = await neo4j_session.run(
@@ -251,10 +263,12 @@ async def get_column_fk_relationships(
     query = """
     MATCH (t:Table {name: $table_name})-[:HAS_COLUMN]->(c1:Column {name: $column_name})-[fk:FK_TO]->(c2:Column)<-[:HAS_COLUMN]-(t2:Table)
     RETURN t2.name AS referenced_table,
+           t2.schema AS referenced_table_schema,
            t2.description AS referenced_table_description,
            c2.name AS referenced_column,
            c2.description AS referenced_column_description,
            fk.constraint AS constraint_name
+    ORDER BY t2.name, c2.name
     LIMIT $limit
     """
 
@@ -272,6 +286,8 @@ async def get_column_fk_relationships(
             "referenced_table": record["referenced_table"],
             "referenced_column": record["referenced_column"],
         }
+        if record.get("referenced_table_schema"):
+            fk_info["referenced_table_schema"] = record["referenced_table_schema"]
         if record.get("referenced_table_description"):
             fk_info["referenced_table_description"] = record["referenced_table_description"]
         if record.get("referenced_column_description"):

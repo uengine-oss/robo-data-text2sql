@@ -77,6 +77,13 @@ def _quote_table_identifier(table: str, schema: Optional[str]) -> str:
     return ".".join(f'"{part}"' for part in parts)
 
 
+def _row_sort_key(row) -> Tuple:
+    """행 정렬을 위한 키 생성. 캐싱 일관성을 위해 결과 순서를 보장한다."""
+    return tuple(
+        (str(v) if v is not None else "") for v in row.values()
+    )
+
+
 async def _fetch_rows_with_progressive_keyword(
     context: ToolContext, query_sql: str, keyword: str
 ) -> Tuple[str, List]:
@@ -118,6 +125,9 @@ async def execute(
     schema: Optional[str] = None,
 ) -> str:
     """특정 스키마 내 컬럼에서 키워드와 매칭되는 값을 조회한다."""
+    search_column_values_search_keywords_limit = max(int(context.scaled(context.search_column_values_search_keywords_limit)), 1)
+    search_keywords = search_keywords[:search_column_values_search_keywords_limit]
+
     value_limit = context.scaled(context.value_limit)
     sanitized_schema = SQLGuard.sanitize_identifier(schema) if schema else None
     sanitized_table = SQLGuard.sanitize_identifier(table_name)
@@ -165,6 +175,7 @@ async def execute(
         effective_keyword, query_rows = await _fetch_rows_with_progressive_keyword(
             context, query_sql, normalized_keyword
         )
+        query_rows = sorted(query_rows, key=_row_sort_key)
         result_parts.append(
             open_rows_tag(
                 row_type="query",
@@ -193,6 +204,7 @@ async def execute(
     try:
         default_sql = f"SELECT * FROM {qualified_table} LIMIT {value_limit}"
         default_rows = await context.db_conn.fetch(default_sql)
+        default_rows = sorted(default_rows, key=_row_sort_key)
 
         result_parts.append('<rows type="default">')
         for row in default_rows:

@@ -108,8 +108,11 @@ watch(() => reactStore.status, (status) => {
     }
 })
 
-async function handleStart(question: string) {
-    await reactStore.start(question)
+async function handleStart(
+    question: string,
+    options: { maxToolCalls: number; maxSqlSeconds: number }
+) {
+    await reactStore.start(question, options)
     // 시작 후 자동으로 요약 탭으로 전환 (watch에서 처리됨)
 }
 

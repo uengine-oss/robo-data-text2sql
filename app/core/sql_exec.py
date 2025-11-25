@@ -1,6 +1,6 @@
 """SQL execution with safety and timeout"""
 import asyncio
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import asyncpg
 
 from app.config import settings
@@ -21,10 +21,17 @@ class SQLExecutor:
     async def execute_query(
         self,
         conn: asyncpg.Connection,
-        sql: str
+        sql: str,
+        *,
+        timeout: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
         Execute SQL query and return results with metadata.
+        
+        Args:
+            conn: asyncpg connection.
+            sql: SQL query to execute.
+            timeout: Optional timeout in seconds (defaults to instance timeout).
         
         Returns:
             {
@@ -36,12 +43,13 @@ class SQLExecutor:
         """
         import time
         start_time = time.time()
+        effective_timeout = timeout if timeout is not None else self.timeout
         
         try:
             # Execute with timeout
             rows = await asyncio.wait_for(
                 conn.fetch(sql),
-                timeout=self.timeout
+                timeout=effective_timeout
             )
             
             execution_time_ms = (time.time() - start_time) * 1000
@@ -65,27 +73,49 @@ class SQLExecutor:
             
         except asyncio.TimeoutError:
             raise SQLExecutionError(
-                f"Query execution timeout after {self.timeout} seconds"
+                f"Query execution timeout after {effective_timeout} seconds (max_sql_seconds limit exceeded)"
             )
         except asyncpg.PostgresError as e:
             raise SQLExecutionError(f"Database error: {str(e)}")
         except Exception as e:
             raise SQLExecutionError(f"Execution failed: {str(e)}")
     
-    async def explain_query(
+    async def execute_ddl(
         self,
         conn: asyncpg.Connection,
-        sql: str
-    ) -> List[Dict[str, Any]]:
-        """Get query execution plan"""
-        explain_sql = f"EXPLAIN (FORMAT JSON) {sql}"
+        sql: str,
+        *,
+        timeout: Optional[float] = None,
+    ) -> None:
+        """
+        Execute DDL or utility SQL statement (CREATE, DROP, ANALYZE, etc.).
+        
+        This method is for statements that don't return data rows,
+        such as table creation, index creation, statistics collection, etc.
+        
+        Args:
+            conn: asyncpg connection.
+            sql: DDL or utility SQL statement to execute.
+            timeout: Optional timeout in seconds (defaults to instance timeout).
+        
+        Raises:
+            SQLExecutionError: If execution fails.
+        """
+        effective_timeout = timeout if timeout is not None else self.timeout
         
         try:
-            result = await conn.fetchval(explain_sql)
-            return result
+            await asyncio.wait_for(
+                conn.execute(sql),
+                timeout=effective_timeout
+            )
+        except asyncio.TimeoutError:
+            raise SQLExecutionError(
+                f"DDL execution timeout after {effective_timeout} seconds"
+            )
+        except asyncpg.PostgresError as e:
+            raise SQLExecutionError(f"Database error: {str(e)}")
         except Exception as e:
-            # If EXPLAIN fails, return empty
-            return []
+            raise SQLExecutionError(f"DDL execution failed: {str(e)}")
     
     @staticmethod
     def format_results_for_json(results: Dict[str, Any]) -> Dict[str, Any]:

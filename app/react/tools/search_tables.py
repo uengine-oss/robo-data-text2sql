@@ -17,6 +17,9 @@ async def execute(
     Neo4j 스키마 그래프에서 키워드와 유사한 테이블을 검색한다.
     결과는 prompt.xml 지시에 맞춰 XML 문자열로 반환한다.
     """
+    search_table_keyword_limit = max(int(context.scaled(context.search_table_keyword_limit)), 1)
+    keywords = keywords[:search_table_keyword_limit]
+
     table_top_k = max(int(context.scaled(context.table_top_k)), 1)
     relation_limit = max(int(context.scaled(context.table_relation_limit)), 0)
     table_fetch_limit = max(table_top_k * 5, table_top_k)
@@ -70,6 +73,16 @@ async def execute(
 
             fk_relationships = relationship_details["fk_relationships"]
             if fk_relationships:
+                fk_relationships = sorted(
+                    fk_relationships,
+                    key=lambda r: (
+                        r.get("related_table_schema") or "",
+                        r.get("related_table") or "",
+                        r.get("from_column") or "",
+                        r.get("to_column") or "",
+                        r.get("relation_type") or "",
+                    ),
+                )
                 result_parts.append("<fk_relationships>")
                 for rel in fk_relationships:
                     result_parts.append("<fk_relationship>")
@@ -100,6 +113,13 @@ async def execute(
 
             relationships_to_output = relationship_details["additional_relationships"]
             if relationships_to_output:
+                relationships_to_output = sorted(
+                    relationships_to_output,
+                    key=lambda r: (
+                        r.get("related_table_schema") or "",
+                        r.get("related_table") or "",
+                    ),
+                )
                 result_parts.append("<relationships>")
                 for rel in relationships_to_output:
                     result_parts.append("<relationship>")
@@ -163,7 +183,7 @@ def _select_table_matches(
     if not remaining_candidates:
         return similarity_selected
 
-    max_similarity = max(candidate.score for candidate in remaining_candidates) or 0
+    max_similarity = max(candidate.score for candidate in unique_candidates) or 0
     similarity_normalizer = max_similarity if max_similarity > 0 else 1
 
     scored_candidates = []
@@ -211,4 +231,6 @@ def _select_table_matches(
         needed = secondary_count - len(secondary_selection)
         secondary_selection.extend(fallback_candidates[:needed])
 
-    return similarity_selected + secondary_selection
+    result = similarity_selected + secondary_selection
+    result.sort(key=lambda m: (m.schema or "", m.name))
+    return result

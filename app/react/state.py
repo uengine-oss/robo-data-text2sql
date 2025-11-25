@@ -206,6 +206,10 @@ class ReactSessionState:
     step_confirmation_mode: bool = False
     awaiting_step_confirmation: bool = False
     search_table_candidates: List[Dict[str, str]] = field(default_factory=list)
+    max_sql_seconds: int = 60
+    prefer_language: str = "ko"
+    explained_sqls: List[str] = field(default_factory=list)
+    pending_agent_question: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -220,6 +224,10 @@ class ReactSessionState:
             "step_confirmation_mode": self.step_confirmation_mode,
             "awaiting_step_confirmation": self.awaiting_step_confirmation,
             "search_table_candidates": self.search_table_candidates,
+            "max_sql_seconds": self.max_sql_seconds,
+            "prefer_language": self.prefer_language,
+            "explained_sqls": self.explained_sqls,
+            "pending_agent_question": self.pending_agent_question,
         }
 
     def add_previous_reasoning(self, step: int, reasoning: str, limit: int) -> None:
@@ -249,6 +257,8 @@ class ReactSessionState:
         search_table_candidates = cls._normalize_search_table_candidates(
             data.get("search_table_candidates", [])
         )
+        explained_sqls = cls._normalize_explained_sqls(data.get("explained_sqls", []))
+        pending_agent_question = (data.get("pending_agent_question") or "").strip()
         return cls(
             user_query=data["user_query"],
             dbms=data["dbms"],
@@ -261,6 +271,10 @@ class ReactSessionState:
             step_confirmation_mode=data.get("step_confirmation_mode", False),
             awaiting_step_confirmation=data.get("awaiting_step_confirmation", False),
             search_table_candidates=search_table_candidates,
+            max_sql_seconds=data.get("max_sql_seconds", 60),
+            prefer_language=data.get("prefer_language", "ko"),
+            explained_sqls=explained_sqls,
+            pending_agent_question=pending_agent_question,
         )
 
     @staticmethod
@@ -277,6 +291,8 @@ class ReactSessionState:
         search_table_candidates = cls._normalize_search_table_candidates(
             data.get("search_table_candidates", [])
         )
+        explained_sqls = cls._normalize_explained_sqls(data.get("explained_sqls", []))
+        pending_agent_question = (data.get("pending_agent_question") or "").strip()
         return cls(
             user_query=data["user_query"],
             dbms=data["dbms"],
@@ -289,6 +305,10 @@ class ReactSessionState:
             step_confirmation_mode=data.get("step_confirmation_mode", False),
             awaiting_step_confirmation=data.get("awaiting_step_confirmation", False),
             search_table_candidates=search_table_candidates,
+            max_sql_seconds=data.get("max_sql_seconds", 60),
+            prefer_language=data.get("prefer_language", "ko"),
+            explained_sqls=explained_sqls,
+            pending_agent_question=pending_agent_question,
         )
 
     @classmethod
@@ -299,6 +319,8 @@ class ReactSessionState:
         remaining_tool_calls: int,
         partial_sql: str = "SELECT PLACEHOLDER_COLUMNS FROM PLACEHOLDER_TABLE",
         step_confirmation_mode: bool = False,
+        max_sql_seconds: int = 60,
+        prefer_language: str = "ko",
     ) -> "ReactSessionState":
         return cls(
             user_query=user_query,
@@ -308,6 +330,9 @@ class ReactSessionState:
             current_tool_result="<tool_result/>",
             step_confirmation_mode=step_confirmation_mode,
             search_table_candidates=[],
+            max_sql_seconds=max_sql_seconds,
+            prefer_language=prefer_language,
+            explained_sqls=[],
         )
 
     @staticmethod
@@ -365,3 +390,37 @@ class ReactSessionState:
                 )
 
         return normalized
+
+    @staticmethod
+    def _normalize_explained_sqls(entries: Any) -> List[str]:
+        """Normalize explained SQLs list."""
+        if not isinstance(entries, list):
+            return []
+        return [str(sql).strip() for sql in entries if sql]
+
+    def add_explained_sql(self, sql: str) -> None:
+        """Add a SQL that has been explained."""
+        normalized = self._normalize_sql_for_comparison(sql)
+        if normalized and normalized not in [
+            self._normalize_sql_for_comparison(s) for s in self.explained_sqls
+        ]:
+            self.explained_sqls.append(sql.strip())
+
+    def is_sql_explained(self, sql: str) -> bool:
+        """Check if a SQL has been explained."""
+        normalized = self._normalize_sql_for_comparison(sql)
+        if not normalized:
+            return False
+        for explained_sql in self.explained_sqls:
+            if self._normalize_sql_for_comparison(explained_sql) == normalized:
+                return True
+        return False
+
+    @staticmethod
+    def _normalize_sql_for_comparison(sql: str) -> str:
+        """Normalize SQL for comparison (remove extra whitespace)."""
+        if not sql:
+            return ""
+        import re
+        # Collapse all whitespace to single spaces and strip
+        return re.sub(r'\s+', ' ', sql.strip()).lower()

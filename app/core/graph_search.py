@@ -56,7 +56,7 @@ class GraphSearcher:
                node.db AS db,
                node.description AS description,
                score
-        ORDER BY score DESC
+        ORDER BY score DESC, node.schema ASC, node.name ASC
         """
         
         result = await self.session.run(query, k=k, embedding=query_embedding)
@@ -87,7 +87,7 @@ class GraphSearcher:
                node.description AS description,
                node.nullable AS nullable,
                score
-        ORDER BY score DESC
+        ORDER BY score DESC, t.name ASC, node.name ASC
         """
         
         result = await self.session.run(query, k=k, embedding=query_embedding)

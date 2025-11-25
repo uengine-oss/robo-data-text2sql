@@ -6,6 +6,7 @@ from . import (
     get_table_schema as get_table_schema_tool,
     search_column_values as search_column_values_tool,
     execute_sql_preview as execute_sql_preview_tool,
+    explain as explain_tool,
 )
 
 
@@ -18,6 +19,7 @@ TOOL_HANDLERS = {
     "get_table_schema": get_table_schema_tool.execute,
     "search_column_values": search_column_values_tool.execute,
     "execute_sql_preview": execute_sql_preview_tool.execute,
+    "explain": explain_tool.execute,
 }
 
 
@@ -59,6 +61,12 @@ async def execute_tool(
         )
 
     if tool_name == "execute_sql_preview":
+        sql_text = parameters.get("sql")
+        if not sql_text:
+            raise ToolExecutionError("sql parameter is required")
+        return await handler(context, sql_text)
+    
+    if tool_name == "explain":
         sql_text = parameters.get("sql")
         if not sql_text:
             raise ToolExecutionError("sql parameter is required")

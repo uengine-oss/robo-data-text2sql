@@ -135,6 +135,7 @@ async def _fetch_column_values(
         f"SELECT DISTINCT {column_identifier} AS value "
         f"FROM {table_identifier} "
         f"WHERE {column_identifier} IS NOT NULL "
+        f"ORDER BY {column_identifier} "
         f"LIMIT {limit}"
     )
     rows = await conn.fetch(query)
@@ -146,6 +147,9 @@ async def execute(
     table_names: List[str],
 ) -> str:
     """Neo4j 에 저장된 테이블 스키마 정보를 조회한다."""
+    get_table_schema_table_name_limit = max(int(context.scaled(context.get_table_schema_table_name_limit)), 1)
+    table_names = table_names[:get_table_schema_table_name_limit]
+
     column_relation_limit = context.scaled(context.column_relation_limit)
     value_limit = min(10, context.scaled(context.value_limit))
     normalized_table_names = [
@@ -266,9 +270,21 @@ async def execute(
                 limit=column_relation_limit,
             )
             if fk_relationships:
+                fk_relationships = sorted(
+                    fk_relationships,
+                    key=lambda fk: (
+                        fk.get("referenced_table_schema") or "",
+                        fk.get("referenced_table") or "",
+                        fk.get("referenced_column") or "",
+                    ),
+                )
                 result_parts.append("<foreign_keys>")
                 for fk in fk_relationships:
                     result_parts.append("<foreign_key>")
+                    if fk.get("referenced_table_schema"):
+                        result_parts.append(
+                            f"<referenced_table_schema>{fk['referenced_table_schema']}</referenced_table_schema>"
+                        )
                     result_parts.append(f"<referenced_table>{fk['referenced_table']}</referenced_table>")
                     if fk.get("referenced_table_description"):
                         result_parts.append(

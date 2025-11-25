@@ -130,6 +130,8 @@ export interface ReactRequest {
   max_iterations?: number | null
   session_state?: string | null
   user_response?: string | null
+  max_sql_seconds?: number
+  prefer_language?: string
 }
 
 export type ReactStreamEvent =

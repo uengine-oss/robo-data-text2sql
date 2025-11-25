@@ -140,7 +140,13 @@ export const useReactStore = defineStore('react', () => {
         }
     }
 
-    async function start(question: string) {
+    async function start(
+        question: string,
+        options?: {
+            maxToolCalls?: number
+            maxSqlSeconds?: number
+        }
+    ) {
         cancelOngoing()
         resetState()
         currentQuestion.value = question
@@ -151,7 +157,9 @@ export const useReactStore = defineStore('react', () => {
         abortController.value = controller
         await consumeStream(
             {
-                question
+                question,
+                max_tool_calls: options?.maxToolCalls,
+                max_sql_seconds: options?.maxSqlSeconds
             },
             controller
         )
