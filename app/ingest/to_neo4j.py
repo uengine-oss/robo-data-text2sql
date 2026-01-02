@@ -74,19 +74,26 @@ class Neo4jSchemaLoader:
     async def load_tables(self, tables: List[Dict[str, Any]], db_name: str = "postgres"):
         """Load tables into Neo4j with embeddings"""
         for table in tables:
+            # Normalize table name to lowercase for consistent MERGE
+            table_name_lower = table["name"].lower()
+            table_name_original = table["name"]
+            schema_lower = table["schema"].lower()
+            
             # Generate embedding
+            description = table.get("description") or ""
             text = self.embedding_client.format_table_text(
-                table_name=table["name"],
-                description=table.get("description", ""),
+                table_name=table_name_original,
+                description=description,
                 columns=[]  # Will add later
             )
             embedding = await self.embedding_client.embed_text(text)
             
-            # Create table node
+            # Create table node - use lowercase name for MERGE to match existing nodes
             query = """
             MERGE (t:Table {db: $db, schema: $schema, name: $name})
             SET t.vector = $vector,
-                t.description = $description,
+                t.description = COALESCE(t.description, $description),
+                t.original_name = $original_name,
                 t.updated_at = datetime()
             RETURN t
             """
@@ -94,10 +101,11 @@ class Neo4jSchemaLoader:
             await self.session.run(
                 query,
                 db=db_name,
-                schema=table["schema"],
-                name=table["name"],
+                schema=schema_lower,
+                name=table_name_lower,
                 vector=embedding,
-                description=table.get("description") or ""
+                description=description,
+                original_name=table_name_original
             )
         
         print(f"Loaded {len(tables)} tables")
@@ -132,13 +140,17 @@ class Neo4jSchemaLoader:
             fqn = f"{col['schema']}.{col['table_name']}.{col['name']}".lower()
             nullable = self._normalize_nullable(col.get("nullable"))
             
+            # Normalize table name and schema to lowercase for MATCH
+            table_name_lower = col["table_name"].lower()
+            schema_lower = col["schema"].lower()
+            
             query = """
             MATCH (t:Table {db: $db, schema: $schema, name: $table_name})
             MERGE (c:Column {fqn: $fqn})
             SET c.vector = $vector,
                 c.name = $column_name,
                 c.dtype = $dtype,
-                c.description = $description,
+                c.description = COALESCE(c.description, $description),
                 c.nullable = $nullable,
                 c.updated_at = datetime()
             MERGE (t)-[:HAS_COLUMN]->(c)
@@ -148,8 +160,8 @@ class Neo4jSchemaLoader:
             await self.session.run(
                 query,
                 db=db_name,
-                schema=col["schema"],
-                table_name=col["table_name"],
+                schema=schema_lower,
+                table_name=table_name_lower,
                 fqn=fqn,
                 vector=embedding,
                 column_name=col["name"],
@@ -198,10 +210,10 @@ class Neo4jSchemaLoader:
             await self.session.run(
                 query2,
                 db=db_name,
-                from_schema=fk["from_schema"],
-                from_table=fk["from_table"],
-                to_schema=fk["to_schema"],
-                to_table=fk["to_table"]
+                from_schema=fk["from_schema"].lower(),
+                from_table=fk["from_table"].lower(),
+                to_schema=fk["to_schema"].lower(),
+                to_table=fk["to_table"].lower()
             )
         
         print(f"Loaded {len(foreign_keys)} foreign keys")

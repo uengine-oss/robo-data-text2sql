@@ -1,0 +1,38 @@
+# 스키마 먼저 생성
+docker exec -i postgres_text2sql psql -U testuser -d testdb -c "CREATE SCHEMA IF NOT EXISTS rwis;"
+
+# 각 테이블 생성
+docker exec -i postgres_text2sql psql -U testuser -d testdb < waterrwis/ddl_postgresql/RDF01HH_TB.sql
+docker exec -i postgres_text2sql psql -U testuser -d testdb < waterrwis/ddl_postgresql/RDIEVENT_TB.sql
+docker exec -i postgres_text2sql psql -U testuser -d testdb < waterrwis/ddl_postgresql/RDISAUP_TB.sql
+docker exec -i postgres_text2sql psql -U testuser -d testdb < waterrwis/ddl_postgresql/RDITAGUNIT_TB.sql
+docker exec -i postgres_text2sql psql -U testuser -d testdb < waterrwis/ddl_postgresql/RDITAG_TB.sql
+docker exec -i postgres_text2sql psql -U testuser -d testdb < waterrwis/ddl_postgresql/RDZGACODE_TB.sql
+docker exec -i postgres_text2sql psql -U testuser -d testdb < waterrwis/ddl_postgresql/RDZGAHIGHLIST_TB.sql
+docker exec -i postgres_text2sql psql -U testuser -d testdb < waterrwis/ddl_postgresql/RDZGALIST_TB.sql
+docker exec -i postgres_text2sql psql -U testuser -d testdb < waterrwis/ddl_postgresql/RDR01MI_TB_OLD.sql
+
+echo "테이블 생성 완료!"
+
+# 생성된 테이블 조회 
+docker exec postgres_text2sql psql -U testuser -d testdb -c "\dt rwis.*"
+
+# 데이터 밀어넣기
+docker exec -i postgres_text2sql psql -U testuser -d testdb < waterrwis/ddl_postgresql/sample_data.sql
+
+
+# 기존 데이터 삭제 
+docker exec -i postgres_text2sql psql -U testuser -d testdb <<EOF
+DELETE FROM rwis."RDF01HH_TB";
+DELETE FROM rwis."RDR01MI_TB_OLD";
+DELETE FROM rwis."RDIEVENT_TB";
+DELETE FROM rwis."RDZGAHIGHLIST_TB";
+DELETE FROM rwis."RDZGALIST_TB";
+DELETE FROM rwis."RDITAG_TB";
+DELETE FROM rwis."RDZGACODE_TB";
+DELETE FROM rwis."RDISAUP_TB";
+DELETE FROM rwis."RDITAGUNIT_TB";
+EOF
+
+# 다시 데이터 삽입
+docker exec -i postgres_text2sql psql -U testuser -d testdb < waterrwis/ddl_postgresql/sample_data.sql

@@ -67,7 +67,8 @@ async def vectorize_graph(
             WHERE ($db IS NULL OR (t.db IS NOT NULL AND toLower(t.db) = toLower($db)))
               AND ($schema IS NULL OR (t.schema IS NOT NULL AND toLower(t.schema) = toLower($schema)))
               AND ($reembed = true OR t.vector IS NULL OR size(t.vector) = 0)
-            RETURN elementId(t) AS tid, t.db AS db, t.schema AS schema, t.name AS name, coalesce(t.description, '') AS description
+            RETURN elementId(t) AS tid, t.db AS db, t.schema AS schema, t.name AS name, 
+                   coalesce(t.description, '') AS description
             ORDER BY schema, name
             """
             result = await neo4j_session.run(
@@ -79,9 +80,13 @@ async def vectorize_graph(
             tables: List[Dict[str, Any]] = [record.data() async for record in result]
 
             for item in tables:
-                # Use description ONLY for table embedding
-                description_text = item.get("description", "") or ""
-                vector = await embedding_client.embed_text(description_text)
+                # Use description for table embedding
+                description = item.get("description", "") or ""
+                text = embedding_client.format_table_text(
+                    table_name=item.get("name", ""),
+                    description=description
+                )
+                vector = await embedding_client.embed_text(text)
                 set_q = """
                 MATCH (t)
                 WHERE elementId(t) = $tid

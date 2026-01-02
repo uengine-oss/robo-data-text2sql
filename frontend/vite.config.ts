@@ -10,7 +10,7 @@ export default defineConfig({
     // 직접 접근 시에는 아래 프록시 활성화
     proxy: {
       '/api': {
-        target: 'http://127.0.0.1:8001',
+        target: 'http://127.0.0.1:8000',
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api/, '')
       }
