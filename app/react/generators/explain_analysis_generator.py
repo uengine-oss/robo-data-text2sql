@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import time
 import traceback
 from dataclasses import dataclass, field, asdict
@@ -55,8 +56,35 @@ class ExplainAnalysisLLMResponse:
     validation_queries: List[ValidationQuery]
 
     @classmethod
-    def from_xml(cls, xml_text: str) -> "ExplainAnalysisLLMResponse":
+    def from_xml(
+        cls,
+        xml_text: str,
+        *,
+        react_run_id: Optional[str] = None,
+    ) -> "ExplainAnalysisLLMResponse":
         raw = (xml_text or "").strip()
+
+        normalized_info = _normalize_llm_validation_plan_xml(raw)
+        if normalized_info.get("trimmed") or normalized_info.get("steps"):
+            SmartLogger.log(
+                "WARNING",
+                "react.explain.llm.response.normalized",
+                category="react.explain.llm.response.normalized",
+                params=sanitize_for_log(
+                    {
+                        "react_run_id": react_run_id,
+                        "steps": normalized_info.get("steps", []),
+                        "trimmed": normalized_info.get("trimmed", False),
+                        "original_len": len(raw),
+                        "normalized_len": len(normalized_info.get("xml") or ""),
+                        "trim_prefix_len": normalized_info.get("trim_prefix_len", 0),
+                        "trim_suffix_len": normalized_info.get("trim_suffix_len", 0),
+                        "trim_suffix_preview": normalized_info.get("trim_suffix_preview", ""),
+                    }
+                ),
+            )
+
+        raw = str(normalized_info.get("xml") or raw).strip()
         sanitized = XmlUtil.sanitize_xml_text(raw)
         repaired = XmlUtil.repair_llm_xml_text(
             sanitized,
@@ -293,7 +321,10 @@ class ExplainAnalysisGenerator:
         )
 
         llm_response_text = await self._call_llm(prompt_input, react_run_id=react_run_id)
-        parsed_response = ExplainAnalysisLLMResponse.from_xml(llm_response_text)
+        parsed_response = ExplainAnalysisLLMResponse.from_xml(
+            llm_response_text,
+            react_run_id=react_run_id,
+        )
 
         validation_results = await self._execute_validation_queries(
             parsed_response.validation_queries,
@@ -550,3 +581,125 @@ class ExplainAnalysisGenerator:
         parts.append("</table_metadata>")
         parts.append("</input>")
         return "\n".join(parts)
+
+
+def _normalize_llm_validation_plan_xml(text: str) -> dict:
+    """
+    Best-effort normalization for LLM responses that are supposed to contain a single
+    <validation_plan>...</validation_plan> XML document.
+
+    Handles common wrappers/noise:
+    - Top-level <![CDATA[ ... ]]>
+    - Markdown fences (```xml ... ```)
+    - Outer wrapper tags like <output>...</output>
+    - Prefix/suffix non-XML text before/after the desired block
+    """
+    original = (text or "")
+    s = original.strip()
+    steps: List[str] = []
+    trimmed = False
+    trim_prefix_len = 0
+    trim_suffix_len = 0
+    trim_suffix_preview = ""
+
+    # 1) Extract first markdown fenced block if present.
+    if "```" in s:
+        fence_match = re.search(
+            r"```(?:xml)?\s*[\r\n]+([\s\S]*?)\s*```",
+            s,
+            flags=re.IGNORECASE,
+        )
+        if fence_match:
+            extracted = fence_match.group(1) or ""
+            # Determine if we trimmed anything.
+            start, end = fence_match.span()
+            trimmed = trimmed or (start > 0 or end < len(s))
+            trim_prefix_len += start
+            trim_suffix_len += (len(s) - end)
+            trim_suffix_preview = (s[end : end + 200] if end < len(s) else "")
+            s = extracted.strip()
+            steps.append("code_fence_extracted")
+
+    # 2) Unwrap top-level CDATA.
+    if s.startswith("<![CDATA[") and s.endswith("]]>"):
+        inner = s[len("<![CDATA[") : -len("]]>")]
+        # CDATA could contain leading/trailing newlines; keep trimming consistent.
+        s = inner.strip()
+        steps.append("top_level_cdata_unwrapped")
+
+    # 3) Extract the first <validation_plan>...</validation_plan> block anywhere in the text.
+    extract_info = _extract_first_tag_block(s, "validation_plan")
+    if extract_info.get("found"):
+        extracted_xml = str(extract_info.get("xml") or "").strip()
+        if extracted_xml and extracted_xml != s:
+            trimmed = True
+            # Prefer the extractor's prefix/suffix lengths for better diagnostics.
+            trim_prefix_len = int(extract_info.get("trim_prefix_len") or 0)
+            trim_suffix_len = int(extract_info.get("trim_suffix_len") or 0)
+            trim_suffix_preview = str(extract_info.get("trim_suffix_preview") or "")
+            s = extracted_xml
+            steps.append("validation_plan_extracted")
+
+    return {
+        "xml": s,
+        "steps": steps,
+        "trimmed": trimmed,
+        "trim_prefix_len": trim_prefix_len,
+        "trim_suffix_len": trim_suffix_len,
+        "trim_suffix_preview": trim_suffix_preview,
+    }
+
+
+def _extract_first_tag_block(text: str, tag_name: str) -> dict:
+    """
+    Extract the first <tag_name>...</tag_name> block from text, even if surrounded by noise.
+    Uses a depth counter over start/end tags (best-effort; tag nesting is not expected).
+    """
+    s = (text or "")
+    start = s.find(f"<{tag_name}")
+    if start < 0:
+        return {"found": False, "xml": s, "trim_prefix_len": 0, "trim_suffix_len": 0, "trim_suffix_preview": ""}
+
+    # Scan tags from the first occurrence.
+    tag_iter = re.finditer(rf"</?{re.escape(tag_name)}\b", s[start:], flags=re.IGNORECASE)
+    depth = 0
+    end_inclusive = -1
+    for m in tag_iter:
+        is_close = (m.group(0) or "").startswith("</")
+        if not is_close:
+            depth += 1
+            continue
+        depth -= 1
+        if depth <= 0:
+            # Find the closing '>' for the end tag to be robust to whitespace like </tag  >
+            close_tag_name_end = start + m.end()
+            gt_idx = s.find(">", close_tag_name_end)
+            if gt_idx >= 0:
+                end_inclusive = gt_idx + 1
+            else:
+                # Fallback: assume canonical </tag_name> length
+                end_inclusive = start + m.start() + len(f"</{tag_name}>")
+            break
+
+    if end_inclusive < 0:
+        extracted = s[start:]
+        trim_prefix_len = start if start > 0 else 0
+        return {
+            "found": True,
+            "xml": extracted,
+            "trim_prefix_len": trim_prefix_len,
+            "trim_suffix_len": 0,
+            "trim_suffix_preview": "",
+        }
+
+    extracted = s[start:end_inclusive]
+    trim_prefix_len = start if start > 0 else 0
+    trim_suffix_len = (len(s) - end_inclusive) if end_inclusive < len(s) else 0
+    trim_suffix_preview = s[end_inclusive : end_inclusive + 200] if trim_suffix_len > 0 else ""
+    return {
+        "found": True,
+        "xml": extracted,
+        "trim_prefix_len": trim_prefix_len,
+        "trim_suffix_len": trim_suffix_len,
+        "trim_suffix_preview": trim_suffix_preview,
+    }

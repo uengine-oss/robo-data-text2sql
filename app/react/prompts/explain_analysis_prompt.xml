@@ -71,7 +71,13 @@
 		</instruction>
 
 		<instruction id="4" name="Output Formatting">
-			<detail>You must output the result in the specified XML format only. Do not include any conversational text outside the XML tags.</detail>
+			<detail>
+You must output the result in the specified XML format only.
+- Return a single XML document whose root element is &lt;validation_plan&gt;...&lt;/validation_plan&gt;.
+- Do NOT wrap the entire output in CDATA (e.g., &lt;![CDATA[ ... ]]&gt; at the top level).
+- Do NOT include markdown code fences like ```xml or ``` or any text outside the XML.
+- Do NOT add any extra wrapper elements such as &lt;output&gt;...&lt;/output&gt;.
+			</detail>
 		</instruction>
 	</core_instructions>
 
@@ -79,7 +85,6 @@
 		<title>XML Output Structure</title>
 		<description>The output must be a valid XML block as follows:</description>
 		<structure>
-<![CDATA[
 <validation_plan>
     <risk_analysis>
         <!-- Brief summary of why these validation queries are needed -->
@@ -93,7 +98,6 @@
         <!-- Repeat for up to 5 queries -->
     </queries>
 </validation_plan>
-]]>
 		</structure>
 		<note>All SQL queries in the output MUST follow the identifier quoting and schema qualification rules specified in instruction #3</note>
 	</output_format>
@@ -106,7 +110,6 @@
 				<meta>orders table has approx 10M rows. users table has 1M rows.</meta>
 			</input>
 			<output>
-<![CDATA[
 <validation_plan>
     <risk_analysis>
         <summary>The query performs a Sequential Scan on the large 'orders' table for a 4-year range. The planner estimates 500k rows, but actual volume might be significantly higher, causing the Nested Loop to timeout. Validation is needed to check the selectivity of the date range and user status.</summary>
@@ -122,7 +125,6 @@
         </query>
     </queries>
 </validation_plan>
-]]>
 			</output>
 		</example>
 	</examples>

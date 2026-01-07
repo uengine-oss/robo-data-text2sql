@@ -196,6 +196,7 @@ async def run_react(
                 max_iterations=request.max_iterations,
                 user_response=request.user_response,
                 react_run_id=react_run_id,
+                api_started_perf_counter=api_started,
             ):
                 event_type = event["type"]
 

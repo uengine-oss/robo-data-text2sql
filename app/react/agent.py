@@ -223,6 +223,7 @@ class ReactAgent:
         max_iterations: Optional[int] = None,
         user_response: Optional[str] = None,
         react_run_id: Optional[str] = None,
+        api_started_perf_counter: Optional[float] = None,
         on_step: Optional[Callable[[ReactStep, ReactSessionState], Awaitable[None]]] = None,
         on_outcome: Optional[Callable[[AgentOutcome, ReactSessionState], Awaitable[None]]] = None,
         on_phase: Optional[Callable[[str, int, Dict[str, Any], ReactSessionState], Awaitable[None]]] = None,
@@ -232,11 +233,24 @@ class ReactAgent:
         user_response 가 주어지면 가장 최근 tool_result 로 전달한다.
         """
         run_id = react_run_id or _new_react_run_id()
+        run_started = time.perf_counter()
         last_input_xml: Optional[str] = None
         last_llm_response: Optional[str] = None
         last_tool_name: Optional[str] = None
         last_tool_parameters: Optional[Dict[str, Any]] = None
         last_tool_result: Optional[str] = None
+        outcome: Optional[AgentOutcome] = None
+        final_exception: Optional[BaseException] = None
+        final_traceback: Optional[str] = None
+        cancelled: bool = False
+
+        # Per-iteration profile summary (level-0: no raw SQL/question)
+        iteration_profiles: List[Dict[str, Any]] = []
+        totals = {
+            "llm_elapsed_ms_sum": 0.0,
+            "llm_reprint_elapsed_ms_sum": 0.0,
+            "tool_elapsed_ms_sum": 0.0,
+        }
 
         if user_response:
             parts = ["<tool_result>"]
@@ -284,12 +298,31 @@ class ReactAgent:
                 input_xml = self._build_input_xml(state)
                 last_input_xml = input_xml
 
-                llm_response = await self._call_llm(
-                    input_xml,
-                    react_run_id=run_id,
-                    iteration=state.iteration,
-                )
-                last_llm_response = llm_response
+                iter_profile: Dict[str, Any] = {
+                    "iteration": state.iteration,
+                    "llm_elapsed_ms": None,
+                    "llm_reprint_elapsed_ms": None,
+                    "tool_name": None,
+                    "tool_executed": None,
+                    "tool_elapsed_ms": None,
+                }
+                iteration_profiles.append(iter_profile)
+
+                llm_started = time.perf_counter()
+                llm_response: Optional[str] = None
+                try:
+                    llm_response = await self._call_llm(
+                        input_xml,
+                        react_run_id=run_id,
+                        iteration=state.iteration,
+                    )
+                    last_llm_response = llm_response
+                finally:
+                    llm_elapsed_ms = (time.perf_counter() - llm_started) * 1000.0
+                    iter_profile["llm_elapsed_ms"] = llm_elapsed_ms
+                    totals["llm_elapsed_ms_sum"] += llm_elapsed_ms
+                if llm_response is None:
+                    raise ReactAgentError("LLM call did not return a response.")
 
                 try:
                     parsed_step = self._parse_llm_response(
@@ -314,12 +347,21 @@ class ReactAgent:
                             }
                         ),
                     )
-                    reprinted = await self._call_llm_xml_reprint(
-                        llm_response,
-                        react_run_id=run_id,
-                        iteration=state.iteration,
-                    )
-                    last_llm_response = reprinted
+                    reprint_started = time.perf_counter()
+                    reprinted: Optional[str] = None
+                    try:
+                        reprinted = await self._call_llm_xml_reprint(
+                            llm_response,
+                            react_run_id=run_id,
+                            iteration=state.iteration,
+                        )
+                        last_llm_response = reprinted
+                    finally:
+                        reprint_elapsed_ms = (time.perf_counter() - reprint_started) * 1000.0
+                        iter_profile["llm_reprint_elapsed_ms"] = reprint_elapsed_ms
+                        totals["llm_reprint_elapsed_ms_sum"] += reprint_elapsed_ms
+                    if reprinted is None:
+                        raise ReactAgentError("LLM reprint did not return a response.")
                     parsed_step = self._parse_llm_response(
                         reprinted,
                         state.iteration,
@@ -365,6 +407,7 @@ class ReactAgent:
                 steps.append(step)
 
                 tool_name = step.tool_call.name
+                iter_profile["tool_name"] = tool_name
 
                 if tool_name == "submit_sql":
                     sql_text = step.tool_call.parsed_parameters.get("sql", "")
@@ -378,6 +421,10 @@ class ReactAgent:
                             "Please call the explain tool first and then try again."
                         )
                 
+                    # submit_sql: no actual tool execution
+                    iter_profile["tool_executed"] = False
+                    iter_profile["tool_elapsed_ms"] = None
+
                     outcome = AgentOutcome(
                         status="submit_sql",
                         steps=steps,
@@ -390,24 +437,15 @@ class ReactAgent:
                         await on_step(step, state)
                     if on_outcome:
                         await on_outcome(outcome, state)
-                    SmartLogger.log(
-                        "INFO",
-                        "react.run.done",
-                        category="react.run.done",
-                        params=sanitize_for_log(
-                            {
-                                "react_run_id": run_id,
-                                "status": outcome.status,
-                                "steps_count": len(steps),
-                                "state_snapshot": state.to_dict(),
-                            }
-                        ),
-                    )
                     return outcome
 
                 if tool_name == "ask_user":
                     question = step.tool_call.parsed_parameters.get("question", "")
                     state.remaining_tool_calls -= 1
+                    # ask_user: no actual tool execution
+                    iter_profile["tool_executed"] = False
+                    iter_profile["tool_elapsed_ms"] = None
+
                     outcome = AgentOutcome(
                         status="ask_user",
                         steps=steps,
@@ -418,20 +456,6 @@ class ReactAgent:
                         await on_step(step, state)
                     if on_outcome:
                         await on_outcome(outcome, state)
-                    SmartLogger.log(
-                        "INFO",
-                        "react.run.done",
-                        category="react.run.done",
-                        params=sanitize_for_log(
-                            {
-                                "react_run_id": run_id,
-                                "status": outcome.status,
-                                "steps_count": len(steps),
-                                "question_to_user": question,
-                                "state_snapshot": state.to_dict(),
-                            }
-                        ),
-                    )
                     return outcome
 
                 # execute_sql_preview는 반드시 explain이 선행되어야 함
@@ -472,14 +496,18 @@ class ReactAgent:
                         }
                     ),
                 )
-                tool_started = time.perf_counter()
                 try:
+                    tool_started = time.perf_counter()
                     tool_result = await execute_tool(
                         tool_name=tool_name,
                         context=tool_context,
                         parameters=step.tool_call.parsed_parameters,
                     )
                 except ToolExecutionError as exc:
+                    tool_elapsed_ms = (time.perf_counter() - tool_started) * 1000.0
+                    iter_profile["tool_executed"] = True
+                    iter_profile["tool_elapsed_ms"] = tool_elapsed_ms
+                    totals["tool_elapsed_ms_sum"] += tool_elapsed_ms
                     SmartLogger.log(
                         "ERROR",
                         "react.tool.error",
@@ -498,6 +526,10 @@ class ReactAgent:
                     )
                     raise ReactAgentError(str(exc)) from exc
                 except Exception as exc:
+                    tool_elapsed_ms = (time.perf_counter() - tool_started) * 1000.0
+                    iter_profile["tool_executed"] = True
+                    iter_profile["tool_elapsed_ms"] = tool_elapsed_ms
+                    totals["tool_elapsed_ms_sum"] += tool_elapsed_ms
                     SmartLogger.log(
                         "ERROR",
                         "react.tool.error",
@@ -517,6 +549,9 @@ class ReactAgent:
                     raise
                 tool_elapsed_ms = (time.perf_counter() - tool_started) * 1000.0
                 last_tool_result = tool_result
+                iter_profile["tool_executed"] = True
+                iter_profile["tool_elapsed_ms"] = tool_elapsed_ms
+                totals["tool_elapsed_ms_sum"] += tool_elapsed_ms
                 SmartLogger.log(
                     "INFO",
                     "react.tool.response",
@@ -561,6 +596,11 @@ class ReactAgent:
                     await on_step(step, state)
 
             raise ReactAgentError("Iteration limit reached without completion.")
+        except asyncio.CancelledError as exc:
+            cancelled = True
+            final_exception = exc
+            final_traceback = traceback.format_exc()
+            raise
         except Exception as exc:
             SmartLogger.log(
                 "ERROR",
@@ -580,7 +620,62 @@ class ReactAgent:
                     }
                 ),
             )
+            final_exception = exc
+            final_traceback = traceback.format_exc()
             raise
+        finally:
+            agent_elapsed_ms = (time.perf_counter() - run_started) * 1000.0
+            api_end_to_end_elapsed_ms: Optional[float] = None
+            if api_started_perf_counter is not None:
+                api_end_to_end_elapsed_ms = (
+                    time.perf_counter() - float(api_started_perf_counter)
+                ) * 1000.0
+            total_elapsed_ms = (
+                api_end_to_end_elapsed_ms
+                if api_end_to_end_elapsed_ms is not None
+                else agent_elapsed_ms
+            )
+
+            # Determine final status for summary
+            if outcome is not None:
+                status = outcome.status
+            elif cancelled:
+                status = "await_step_confirmation" if state.awaiting_step_confirmation else "cancelled"
+            elif final_exception is not None:
+                status = "error"
+            else:
+                status = "unknown"
+
+            SmartLogger.log(
+                "INFO",
+                "react.run.done",
+                category="react.run.done",
+                params=sanitize_for_log(
+                    {
+                        "react_run_id": run_id,
+                        "status": status,
+                        "steps_count": len(steps),
+                        "iterations_count": len(iteration_profiles),
+                        "total_elapsed_ms": total_elapsed_ms,
+                        "agent_elapsed_ms": agent_elapsed_ms,
+                        "api_end_to_end_elapsed_ms": api_end_to_end_elapsed_ms,
+                        "totals": totals,
+                        "iterations": iteration_profiles,
+                        # Minimal safe snapshot (level-0; excludes user_query/sql/tool_result/metadata)
+                        "state": {
+                            "dbms": state.dbms,
+                            "prefer_language": state.prefer_language,
+                            "max_sql_seconds": state.max_sql_seconds,
+                            "remaining_tool_calls": state.remaining_tool_calls,
+                            "iteration": state.iteration,
+                            "step_confirmation_mode": state.step_confirmation_mode,
+                            "awaiting_step_confirmation": state.awaiting_step_confirmation,
+                        },
+                        "exception": repr(final_exception) if final_exception else None,
+                        "traceback": final_traceback,
+                    }
+                ),
+            )
 
     async def stream(
         self,
@@ -589,6 +684,7 @@ class ReactAgent:
         max_iterations: Optional[int] = None,
         user_response: Optional[str] = None,
         react_run_id: Optional[str] = None,
+        api_started_perf_counter: Optional[float] = None,
     ) -> AsyncIterator[Dict[str, Any]]:
         queue: "asyncio.Queue[Dict[str, Any]]" = asyncio.Queue()
 
@@ -631,6 +727,7 @@ class ReactAgent:
                     max_iterations=max_iterations,
                     user_response=user_response,
                     react_run_id=react_run_id,
+                    api_started_perf_counter=api_started_perf_counter,
                     on_step=on_step_callback,
                     on_outcome=on_outcome_callback,
                     on_phase=on_phase_callback,
