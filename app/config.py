@@ -54,7 +54,7 @@ class Settings(BaseSettings):
     langsmith_api_key: str = ""
 
     # ReAct
-    react_openai_llm_model: str = "gpt-5.1-2025-11-13"
+    react_openai_llm_model: str = "gpt-5.2-2025-12-11"
     is_add_delay_after_react_generator: bool = False
     delay_after_react_generator_seconds: int = 5
     previous_reasoning_limit_steps: int = 15
