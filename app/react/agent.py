@@ -130,6 +130,80 @@ def _extract_first_output_xml(xml_text: str) -> Dict[str, Any]:
     return {"xml": extracted, "trimmed": trimmed, "start": start, "end": end_inclusive}
 
 
+def _build_parameters_xml_text(value: str) -> str:
+    """Build a <parameters>...</parameters> XML string with proper escaping."""
+    el = ET.Element("parameters")
+    el.text = value or ""
+    return ET.tostring(el, encoding="unicode")
+
+
+def _tool_result_has_error(tool_result_xml: Optional[str]) -> bool:
+    """
+    Return True if <tool_result> contains an <error> element.
+    If parsing fails, treat as error (conservative).
+    """
+    text = (tool_result_xml or "").strip()
+    if not text:
+        return True
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError:
+        return True
+    return root.find("error") is not None or root.find(".//error") is not None
+
+
+def _rewrite_step_tool_call(
+    *,
+    step: ReactStep,
+    to_tool_name: str,
+    sql_text: str,
+) -> None:
+    """Rewrite the parsed tool_call in-place (name + parameters + raw XML)."""
+    step.tool_call.name = to_tool_name
+    step.tool_call.parsed_parameters = {"sql": sql_text or ""}
+    step.tool_call.raw_parameters_xml = _build_parameters_xml_text(sql_text or "")
+
+
+def _maybe_rewrite_tool_call_for_policy(
+    *,
+    step: ReactStep,
+    state: ReactSessionState,
+) -> Optional[Dict[str, Any]]:
+    """
+    Runtime tool_call rewrite policy.
+    - If remaining_tool_calls <= 1 and tool is execute_sql_preview -> submit_sql
+    - Else if no successful explain yet in session and tool is execute_sql_preview/submit_sql -> explain
+    Keeps 'has_any_explain' relaxed policy: once at least one explain succeeded, allow mismatches.
+    """
+    tool_name = step.tool_call.name
+    if tool_name not in {"execute_sql_preview", "submit_sql"}:
+        return None
+
+    sql_text = (step.tool_call.parsed_parameters or {}).get("sql", "") or ""
+    is_last_call = state.remaining_tool_calls <= 1
+
+    if is_last_call and tool_name == "execute_sql_preview":
+        _rewrite_step_tool_call(step=step, to_tool_name="submit_sql", sql_text=sql_text)
+        return {
+            "from": "execute_sql_preview",
+            "to": "submit_sql",
+            "reason": "last_call_force_submit",
+        }
+
+    if (not is_last_call) and tool_name in {"execute_sql_preview", "submit_sql"}:
+        has_any_explain = state.has_any_explained_sql()
+        is_explained = state.is_sql_explained(sql_text)
+        if (not has_any_explain) and (not is_explained):
+            _rewrite_step_tool_call(step=step, to_tool_name="explain", sql_text=sql_text)
+            return {
+                "from": tool_name,
+                "to": "explain",
+                "reason": "require_explain_first",
+            }
+
+    return None
+
+
 class ReactAgent:
     def __init__(self):
         self.prompt_text = get_prompt_text("react_prompt.xml")
@@ -377,6 +451,24 @@ class ReactAgent:
                         state_snapshot=state.to_dict(),
                     )
             
+                # Runtime tool_call rewrite (explain gate / last call)
+                rewrite_info = _maybe_rewrite_tool_call_for_policy(step=parsed_step, state=state)
+                if rewrite_info:
+                    SmartLogger.log(
+                        "WARNING",
+                        "react.explain_gate.rewritten",
+                        category="react.explain_gate.rewritten",
+                        params=sanitize_for_log(
+                            {
+                                "react_run_id": run_id,
+                                "iteration": state.iteration,
+                                "from_tool": rewrite_info.get("from"),
+                                "to_tool": rewrite_info.get("to"),
+                                "reason": rewrite_info.get("reason"),
+                            }
+                        ),
+                    )
+
                 # Phase: reasoning - LLM 응답 파싱 완료
                 if on_phase:
                     await on_phase(
@@ -423,12 +515,11 @@ class ReactAgent:
                     sql_not_explained = not state.is_sql_explained(sql_text)
                     has_any_explain = state.has_any_explained_sql()
                 
-                    # remaining_tool_calls > 1일 때만 explain 검증
-                    if not is_last_call and sql_not_explained and not has_any_explain:
-                        raise SQLNotExplainedError(
-                            "Before calling submit_sql, you must first validate the SQL with the explain tool. "
-                            "Please call the explain tool first and then try again."
-                        )
+                    # Safety net: never hard-fail. If policy requires explain, rewrite and fall through.
+                    if (not is_last_call) and sql_not_explained and (not has_any_explain):
+                        _rewrite_step_tool_call(step=step, to_tool_name="explain", sql_text=sql_text)
+                        tool_name = step.tool_call.name
+                        iter_profile["tool_name"] = tool_name
                     if not is_last_call and sql_not_explained and has_any_explain:
                         SmartLogger.log(
                             "WARNING",
@@ -444,23 +535,24 @@ class ReactAgent:
                             ),
                         )
                 
-                    # submit_sql: no actual tool execution
-                    iter_profile["tool_executed"] = False
-                    iter_profile["tool_elapsed_ms"] = None
+                    if tool_name == "submit_sql":
+                        # submit_sql: no actual tool execution
+                        iter_profile["tool_executed"] = False
+                        iter_profile["tool_elapsed_ms"] = None
 
-                    outcome = AgentOutcome(
-                        status="submit_sql",
-                        steps=steps,
-                        final_sql=sql_text,
-                        metadata=state.metadata,
-                        was_last_call_submission=is_last_call,
-                        sql_not_explained=sql_not_explained,
-                    )
-                    if on_step:
-                        await on_step(step, state)
-                    if on_outcome:
-                        await on_outcome(outcome, state)
-                    return outcome
+                        outcome = AgentOutcome(
+                            status="submit_sql",
+                            steps=steps,
+                            final_sql=sql_text,
+                            metadata=state.metadata,
+                            was_last_call_submission=is_last_call,
+                            sql_not_explained=sql_not_explained,
+                        )
+                        if on_step:
+                            await on_step(step, state)
+                        if on_outcome:
+                            await on_outcome(outcome, state)
+                        return outcome
 
                 if tool_name == "ask_user":
                     question = step.tool_call.parsed_parameters.get("question", "")
@@ -487,10 +579,9 @@ class ReactAgent:
                     is_explained = state.is_sql_explained(sql_text)
                     has_any_explain = state.has_any_explained_sql()
                     if not is_explained and not has_any_explain:
-                        raise SQLNotExplainedError(
-                            "Before calling execute_sql_preview, you must first validate the SQL with the explain tool. "
-                            "Please call the explain tool first and then try again."
-                        )
+                        _rewrite_step_tool_call(step=step, to_tool_name="explain", sql_text=sql_text)
+                        tool_name = step.tool_call.name
+                        iter_profile["tool_name"] = tool_name
                     if not is_explained and has_any_explain:
                         SmartLogger.log(
                             "WARNING",
@@ -535,13 +626,39 @@ class ReactAgent:
                         }
                     ),
                 )
+                tool_started = time.perf_counter()
+                tool_result: Optional[str] = None
+                synthetic_tool_result = False
+
+                # Soft-fail for missing SQL (prevents ToolExecutionError -> run termination)
+                if tool_name in {"explain", "execute_sql_preview"}:
+                    sql_text = (step.tool_call.parsed_parameters or {}).get("sql", "") or ""
+                    if not sql_text.strip():
+                        synthetic_tool_result = True
+                        tool_result = (
+                            '<tool_result><error code="missing_sql">sql parameter is required</error></tool_result>'
+                        )
+                        SmartLogger.log(
+                            "WARNING",
+                            "react.tool.synthetic_error",
+                            category="react.tool.synthetic_error",
+                            params=sanitize_for_log(
+                                {
+                                    "react_run_id": run_id,
+                                    "iteration": state.iteration,
+                                    "tool_name": tool_name,
+                                    "reason": "missing_sql",
+                                }
+                            ),
+                        )
+
                 try:
-                    tool_started = time.perf_counter()
-                    tool_result = await execute_tool(
-                        tool_name=tool_name,
-                        context=tool_context,
-                        parameters=step.tool_call.parsed_parameters,
-                    )
+                    if not synthetic_tool_result:
+                        tool_result = await execute_tool(
+                            tool_name=tool_name,
+                            context=tool_context,
+                            parameters=step.tool_call.parsed_parameters,
+                        )
                 except ToolExecutionError as exc:
                     tool_elapsed_ms = (time.perf_counter() - tool_started) * 1000.0
                     iter_profile["tool_executed"] = True
@@ -588,9 +705,10 @@ class ReactAgent:
                     raise
                 tool_elapsed_ms = (time.perf_counter() - tool_started) * 1000.0
                 last_tool_result = tool_result
-                iter_profile["tool_executed"] = True
-                iter_profile["tool_elapsed_ms"] = tool_elapsed_ms
-                totals["tool_elapsed_ms_sum"] += tool_elapsed_ms
+                iter_profile["tool_executed"] = not synthetic_tool_result
+                iter_profile["tool_elapsed_ms"] = None if synthetic_tool_result else tool_elapsed_ms
+                if not synthetic_tool_result:
+                    totals["tool_elapsed_ms_sum"] += tool_elapsed_ms
                 SmartLogger.log(
                     "INFO",
                     "react.tool.response",
@@ -610,7 +728,7 @@ class ReactAgent:
                 # explain 호출 시 SQL을 추적
                 if tool_name == "explain":
                     sql_text = step.tool_call.parsed_parameters.get("sql", "")
-                    if sql_text:
+                    if sql_text and tool_result and (not _tool_result_has_error(tool_result)):
                         state.add_explained_sql(sql_text)
             
                 state.current_tool_result = tool_result
