@@ -215,6 +215,8 @@ class ReactAgent:
             allow_context_cache=True,
             include_thoughts=True,
         )
+        # Track current thinking level applied to llm_handle (for dynamic upgrades).
+        self._current_thinking_level: str = "low"
         # Reprint LLM must NOT use cached_content to avoid system prompt collisions.
         self.reprint_llm_handle: ReactLLMHandle = create_react_llm(
             purpose="xml-reprint",
@@ -224,6 +226,24 @@ class ReactAgent:
             include_thoughts=False,
         )
 
+    @staticmethod
+    def _desired_thinking_level(iteration: Optional[int]) -> str:
+        """
+        Dynamic thinking policy (iteration-based):
+        - iteration > 20: high
+        - iteration > 10: medium
+        - else: low
+        """
+        try:
+            it = int(iteration or 0)
+        except (TypeError, ValueError):
+            it = 0
+        if it > 20:
+            return "high"
+        if it > 10:
+            return "medium"
+        return "low"
+
     def _maybe_upgrade_context_cache(
         self,
         *,
@@ -232,20 +252,46 @@ class ReactAgent:
         call_site: str,
     ) -> None:
         """
-        옵션 A: 동일 ReactAgent/run 내에서도, 캐시가 준비되면 다음 LLM 호출부터
-        cached_content를 사용하도록 핸들을 업그레이드합니다.
+        Ensure llm_handle is up-to-date for the current iteration.
+        - Dynamically upgrades thinking_level based on iteration count.
+        - If context cache becomes ready, upgrades the handle to use cached_content.
         """
-        if self.llm_handle.uses_context_cache:
+        desired_level = self._desired_thinking_level(iteration)
+        thinking_changed = desired_level != getattr(self, "_current_thinking_level", "low")
+
+        # If we're already using context cache and thinking_level hasn't changed, no need to rebuild.
+        if self.llm_handle.uses_context_cache and not thinking_changed:
             return
 
-        # Re-check cache state right before calling the LLM.
+        # Re-check cache state right before calling the LLM (and apply desired thinking level).
         upgraded = create_react_llm(
             purpose="react",
-            thinking_level="low",
+            thinking_level=desired_level,
             system_prompt=self.prompt_text,
             allow_context_cache=True,
             include_thoughts=True,
         )
+
+        # Log thinking_level transitions only when crossing thresholds.
+        if thinking_changed:
+            SmartLogger.log(
+                "INFO",
+                "react.llm.thinking_level.changed",
+                category="react.llm.thinking_level.changed",
+                params=sanitize_for_log(
+                    {
+                        "react_run_id": react_run_id,
+                        "iteration": iteration,
+                        "call_site": call_site,
+                        "from_level": getattr(self, "_current_thinking_level", None),
+                        "to_level": desired_level,
+                        "model": getattr(upgraded.llm, "model_name", None)
+                        or getattr(upgraded.llm, "model", None),
+                        "cached_content": upgraded.cached_content_name,
+                    }
+                ),
+            )
+
         if (not self.llm_handle.uses_context_cache) and upgraded.uses_context_cache:
             SmartLogger.log(
                 "INFO",
@@ -266,6 +312,7 @@ class ReactAgent:
                 f"[react.llm.context_cache.upgraded] run={react_run_id} iter={iteration} site={call_site} cached_content={upgraded.cached_content_name}"
             )
         self.llm_handle = upgraded
+        self._current_thinking_level = desired_level
 
     @staticmethod
     def _extract_text_only(content: Any) -> str:
