@@ -1,4 +1,4 @@
-from typing import List, Dict, Any, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from neo4j import AsyncSession
 
@@ -47,13 +47,20 @@ async def get_table_fk_relationships(
     neo4j_session: AsyncSession,
     table_name: str,
     limit: int,
+    schema: Optional[str] = None,
 ) -> List[Dict]:
     """
     특정 테이블과 연관된 다른 테이블 정보를 조회한다.
     기존 run_mocked_tools 로직을 재사용한다.
     """
     query = """
-    MATCH (t:Table {name: $table_name})-[:HAS_COLUMN]->(c1:Column)-[fk:FK_TO]->(c2:Column)<-[:HAS_COLUMN]-(t2:Table)
+    MATCH (t:Table)
+    WHERE (
+      (t.name IS NOT NULL AND toLower(t.name) = toLower($table_name))
+      OR (t.original_name IS NOT NULL AND toLower(t.original_name) = toLower($table_name))
+    )
+      AND ($schema IS NULL OR (t.schema IS NOT NULL AND toLower(t.schema) = toLower($schema)))
+    MATCH (t)-[:HAS_COLUMN]->(c1:Column)-[fk:FK_TO]->(c2:Column)<-[:HAS_COLUMN]-(t2:Table)
     RETURN DISTINCT COALESCE(t2.original_name, t2.name) AS related_table,
            t2.schema AS related_table_schema,
            t2.description AS related_table_description,
@@ -66,7 +73,9 @@ async def get_table_fk_relationships(
     LIMIT $limit
     """
 
-    result = await neo4j_session.run(query, table_name=table_name, limit=limit)
+    result = await neo4j_session.run(
+        query, table_name=table_name, schema=schema, limit=limit
+    )
     records = await result.data()
 
     relationships: List[Dict] = []
@@ -88,7 +97,13 @@ async def get_table_fk_relationships(
 
     if len(relationships) < limit:
         reverse_query = """
-        MATCH (t2:Table)-[:HAS_COLUMN]->(c2:Column)-[fk:FK_TO]->(c1:Column)<-[:HAS_COLUMN]-(t:Table {name: $table_name})
+        MATCH (t:Table)
+        WHERE (
+          (t.name IS NOT NULL AND toLower(t.name) = toLower($table_name))
+          OR (t.original_name IS NOT NULL AND toLower(t.original_name) = toLower($table_name))
+        )
+          AND ($schema IS NULL OR (t.schema IS NOT NULL AND toLower(t.schema) = toLower($schema)))
+        MATCH (t2:Table)-[:HAS_COLUMN]->(c2:Column)-[fk:FK_TO]->(c1:Column)<-[:HAS_COLUMN]-(t)
         RETURN DISTINCT COALESCE(t2.original_name, t2.name) AS related_table,
                t2.schema AS related_table_schema,
                t2.description AS related_table_description,
@@ -104,6 +119,7 @@ async def get_table_fk_relationships(
         reverse_result = await neo4j_session.run(
             reverse_query,
             table_name=table_name,
+            schema=schema,
             limit=limit - len(relationships),
         )
         reverse_records = await reverse_result.data()
@@ -139,10 +155,17 @@ async def get_table_fk_relationships(
 async def get_table_any_relationships(
     neo4j_session: AsyncSession,
     table_name: str,
+    schema: Optional[str] = None,
 ) -> List[Dict]:
     """특정 테이블과 최대 세 단계 이내에 연결된 다양한 관계를 조회한다."""
     query = """
-    MATCH path = (t1:Table {name: $table_name})-[*1..3]-(t2:Table)
+    MATCH (t1:Table)
+    WHERE (
+      (t1.name IS NOT NULL AND toLower(t1.name) = toLower($table_name))
+      OR (t1.original_name IS NOT NULL AND toLower(t1.original_name) = toLower($table_name))
+    )
+      AND ($schema IS NULL OR (t1.schema IS NOT NULL AND toLower(t1.schema) = toLower($schema)))
+    MATCH path = (t1)-[*1..3]-(t2:Table)
     WHERE t1 <> t2
     WITH t2,
          collect(DISTINCT [rel IN relationships(path) | type(rel)]) AS relationship_paths
@@ -165,7 +188,8 @@ async def get_table_any_relationships(
 
     result = await neo4j_session.run(
         query,
-        table_name=table_name
+        table_name=table_name,
+        schema=schema,
     )
     records = await result.data()
 
@@ -187,6 +211,7 @@ async def get_table_relationship_details(
     neo4j_session: AsyncSession,
     table_name: str,
     relation_limit: int,
+    schema: Optional[str] = None,
 ) -> Dict[str, List[Dict]]:
     """특정 테이블과 연관된 FK 및 기타 관계 정보를 묶어서 반환한다."""
     if relation_limit <= 0:
@@ -195,11 +220,16 @@ async def get_table_relationship_details(
     fk_relationships = await get_table_fk_relationships(
         neo4j_session,
         table_name,
+        schema=schema,
         limit=relation_limit,
     )
-    fk_related_tables: Set[str] = {
-        rel["related_table"] for rel in fk_relationships if rel.get("related_table")
-    }
+    fk_related_tables: Set[Tuple[str, str]] = set()
+    for rel in fk_relationships:
+        related_table = rel.get("related_table")
+        if not related_table:
+            continue
+        related_schema = rel.get("related_table_schema") or ""
+        fk_related_tables.add((related_schema, related_table))
 
     remaining_relationship_slots = max(relation_limit - len(fk_relationships), 0)
     additional_relationships: List[Dict[str, Any]] = []
@@ -208,14 +238,16 @@ async def get_table_relationship_details(
         fallback_candidates = await get_table_any_relationships(
             neo4j_session,
             table_name,
+            schema=schema,
         )
         scored_candidates: List[Dict[str, Any]] = []
         for candidate in fallback_candidates:
             candidate_name = candidate.get("related_table")
+            candidate_schema = candidate.get("related_table_schema") or ""
             relationship_paths = candidate.get("relationship_paths") or []
             if (
                 not candidate_name
-                or candidate_name in fk_related_tables
+                or (candidate_schema, candidate_name) in fk_related_tables
                 or not relationship_paths
             ):
                 continue
@@ -258,10 +290,17 @@ async def get_column_fk_relationships(
     table_name: str,
     column_name: str,
     limit: int,
+    schema: Optional[str] = None,
 ) -> List[Dict]:
     """특정 컬럼의 외래키 관계를 조회한다."""
     query = """
-    MATCH (t:Table {name: $table_name})-[:HAS_COLUMN]->(c1:Column {name: $column_name})-[fk:FK_TO]->(c2:Column)<-[:HAS_COLUMN]-(t2:Table)
+    MATCH (t:Table)
+    WHERE (
+      (t.name IS NOT NULL AND toLower(t.name) = toLower($table_name))
+      OR (t.original_name IS NOT NULL AND toLower(t.original_name) = toLower($table_name))
+    )
+      AND ($schema IS NULL OR (t.schema IS NOT NULL AND toLower(t.schema) = toLower($schema)))
+    MATCH (t)-[:HAS_COLUMN]->(c1:Column {name: $column_name})-[fk:FK_TO]->(c2:Column)<-[:HAS_COLUMN]-(t2:Table)
     RETURN COALESCE(t2.original_name, t2.name) AS referenced_table,
            t2.schema AS referenced_table_schema,
            t2.description AS referenced_table_description,
@@ -276,6 +315,7 @@ async def get_column_fk_relationships(
         query,
         table_name=table_name,
         column_name=column_name,
+        schema=schema,
         limit=limit,
     )
     records = await result.data()

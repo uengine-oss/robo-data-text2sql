@@ -406,6 +406,10 @@ class ReactSessionState:
         ]:
             self.explained_sqls.append(sql.strip())
 
+    def has_any_explained_sql(self) -> bool:
+        """Return True if this session has successfully run explain at least once."""
+        return bool(self.explained_sqls)
+
     def is_sql_explained(self, sql: str) -> bool:
         """Check if a SQL has been explained."""
         normalized = self._normalize_sql_for_comparison(sql)

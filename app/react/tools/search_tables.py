@@ -68,6 +68,7 @@ async def execute(
             relationship_details = await get_table_relationship_details(
                 context.neo4j_session,
                 match.name,
+                schema=match.schema,
                 relation_limit=relation_limit,
             )
 

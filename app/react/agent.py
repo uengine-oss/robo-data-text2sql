@@ -18,13 +18,13 @@ from typing import (
 )
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
 
 from app.config import settings
 from app.react.enrich_react_metadata import (
     auto_enrich_tables_from_reasoning
 )
 from app.react.state import ReactMetadata, ReactSessionState, MetadataParseError
+from app.react.llm_factory import create_react_llm
 from app.react.tools import ToolContext, ToolExecutionError, execute_tool
 from app.react.utils import XmlUtil
 from app.react.prompts import get_prompt_text
@@ -133,12 +133,7 @@ def _extract_first_output_xml(xml_text: str) -> Dict[str, Any]:
 class ReactAgent:
     def __init__(self):
         self.prompt_text = get_prompt_text("react_prompt.xml")
-        self.llm = ChatOpenAI(
-            model=settings.react_openai_llm_model,
-            temperature=0,
-            api_key=settings.openai_api_key,
-            reasoning_effort="medium"
-        )
+        self.llm = create_react_llm()
 
     async def _call_llm_xml_reprint(
         self,
@@ -180,8 +175,7 @@ class ReactAgent:
                     "iteration": iteration,
                     "phase": "thinking",
                     "model": getattr(self.llm, "model_name", None)
-                    or getattr(self.llm, "model", None)
-                    or settings.react_openai_llm_model,
+                    or getattr(self.llm, "model", None),
                     "raw_llm_text": raw_llm_text,
                 }
             ),
@@ -423,12 +417,27 @@ class ReactAgent:
                     sql_text = step.tool_call.parsed_parameters.get("sql", "")
                     is_last_call = state.remaining_tool_calls <= 1
                     sql_not_explained = not state.is_sql_explained(sql_text)
+                    has_any_explain = state.has_any_explained_sql()
                 
                     # remaining_tool_calls > 1일 때만 explain 검증
-                    if not is_last_call and sql_not_explained:
+                    if not is_last_call and sql_not_explained and not has_any_explain:
                         raise SQLNotExplainedError(
                             "Before calling submit_sql, you must first validate the SQL with the explain tool. "
                             "Please call the explain tool first and then try again."
+                        )
+                    if not is_last_call and sql_not_explained and has_any_explain:
+                        SmartLogger.log(
+                            "WARNING",
+                            "react.explain_gate.bypassed",
+                            category="react.explain_gate.bypassed",
+                            params=sanitize_for_log(
+                                {
+                                    "react_run_id": run_id,
+                                    "iteration": state.iteration,
+                                    "tool_name": tool_name,
+                                    "reason": "sql_not_exactly_explained_but_session_has_any_explain",
+                                }
+                            ),
                         )
                 
                     # submit_sql: no actual tool execution
@@ -471,10 +480,26 @@ class ReactAgent:
                 # execute_sql_preview는 반드시 explain이 선행되어야 함
                 if tool_name == "execute_sql_preview":
                     sql_text = step.tool_call.parsed_parameters.get("sql", "")
-                    if not state.is_sql_explained(sql_text):
+                    is_explained = state.is_sql_explained(sql_text)
+                    has_any_explain = state.has_any_explained_sql()
+                    if not is_explained and not has_any_explain:
                         raise SQLNotExplainedError(
                             "Before calling execute_sql_preview, you must first validate the SQL with the explain tool. "
                             "Please call the explain tool first and then try again."
+                        )
+                    if not is_explained and has_any_explain:
+                        SmartLogger.log(
+                            "WARNING",
+                            "react.explain_gate.bypassed",
+                            category="react.explain_gate.bypassed",
+                            params=sanitize_for_log(
+                                {
+                                    "react_run_id": run_id,
+                                    "iteration": state.iteration,
+                                    "tool_name": tool_name,
+                                    "reason": "sql_not_exactly_explained_but_session_has_any_explain",
+                                }
+                            ),
                         )
 
                 # Phase: acting - 도구 실행 시작
@@ -824,9 +849,7 @@ class ReactAgent:
                     "iteration": iteration,
                     "phase": "thinking",
                     "model": getattr(self.llm, "model_name", None)
-                    or getattr(self.llm, "model", None)
-                    or settings.react_openai_llm_model,
-                    # System prompt 제외: user가 전달되는 입력(XML)만 로깅
+                    or getattr(self.llm, "model", None),
                     "user_prompt": input_xml,
                 }
             ),
@@ -922,18 +945,41 @@ class ReactAgent:
                     "phase": "thinking",
                     "model": getattr(self.llm, "model_name", None)
                     or getattr(self.llm, "model", None)
-                    or settings.react_openai_llm_model,
                 }
             ),
         )
         
-        full_content = ""
+        def _coerce_chunk_content_to_text(content: Any) -> str:
+            """
+            Normalize streaming chunk content into text.
+            Some providers (e.g., Gemini via LangChain) may emit content as a list of dict parts like:
+              [{'type': 'text', 'text': '...'}]
+            """
+            if content is None:
+                return ""
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                out: List[str] = []
+                for part in content:
+                    if isinstance(part, dict) and "text" in part:
+                        out.append(str(part.get("text") or ""))
+                    else:
+                        out.append(str(part))
+                return "".join(out)
+            if isinstance(content, dict) and "text" in content:
+                return str(content.get("text") or "")
+            return str(content)
+
+        full_content_parts: List[str] = []
         try:
             async for chunk in self.llm.astream(messages):
                 if hasattr(chunk, 'content') and chunk.content:
-                    token = chunk.content
-                    full_content += token
-                    await on_token(iteration, token)
+                    token_text = _coerce_chunk_content_to_text(chunk.content)
+                    if not token_text:
+                        continue
+                    full_content_parts.append(token_text)
+                    await on_token(iteration, token_text)
         except Exception as exc:
             SmartLogger.log(
                 "ERROR",
@@ -950,6 +996,7 @@ class ReactAgent:
             )
             raise
         
+        full_content = "".join(full_content_parts)
         if settings.is_add_delay_after_react_generator:
             await asyncio.sleep(settings.delay_after_react_generator_seconds)
         

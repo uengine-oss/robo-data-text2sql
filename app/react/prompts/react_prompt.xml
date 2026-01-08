@@ -125,6 +125,10 @@
 						<correct>
 							<parameters>["table1", "table2", "table3"]</parameters>
 						</correct>
+						<note>
+							- If schema is known (e.g., from search_tables output), pass each table as "SCHEMA.TABLE" (example: "RWIS.RDWNBNB_TB") to avoid ambiguity when the same table name exists in multiple schemas.
+							- If get_table_schema returns an empty &lt;tool_result&gt; or contains &lt;warning&gt;no_match&lt;/warning&gt;, DO NOT retry the exact same get_table_schema call with the same parameters. Change strategy (pick different tables, adjust keywords, or ask user for clarification in business terms).
+						</note>
 						<incorrect>{"table_names": ["table1", "table2"]}</incorrect>
 					</tool>
 					
@@ -197,7 +201,8 @@
 						<param name="table_names" type="list[string]" max_items="10">Up to 10 table names</param>
 					</parameters>
 					<returns>Schema information including column names, data types, constraints, and relationships</returns>
-					<usage_tip>Get schemas only for tables that seem most relevant to avoid wasting tool calls</usage_tip>
+					<usage_tip>Get schemas only for tables that seem most relevant to avoid wasting tool calls. If schema is known, pass tables as "SCHEMA.TABLE" strings to disambiguate duplicates across schemas.</usage_tip>
+					<usage_tip>If get_table_schema returns empty &lt;tool_result&gt; or &lt;warning&gt;no_match&lt;/warning&gt;, do NOT repeat the same call. Choose a different table set or broaden/narrow search_tables keywords.</usage_tip>
 				</tool>
 				
 				<tool name="search_column_values">

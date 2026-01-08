@@ -28,12 +28,34 @@ def _build_schema_hints(table_names: List[str]) -> Dict[str, str]:
         name = str(raw_name or "").strip()
         if not name:
             continue
-        schema_part, table_part = _split_table_identifier(name)
+        schema_part, table_part = _parse_requested_table_identifier(name)
         normalized_table = _normalize_lower(table_part)
         if not normalized_table or normalized_table in hints or not schema_part:
             continue
         hints[normalized_table] = schema_part
     return hints
+
+
+def _parse_requested_table_identifier(name: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Parse incoming table identifier for tool calls.
+
+    Accepted inputs:
+    - "TABLE"
+    - "SCHEMA.TABLE"
+    - "DB.SCHEMA.TABLE" (or longer): we treat the last two parts as schema/table.
+
+    This is intentionally different from _split_table_identifier (which joins all but last),
+    because tool inputs may contain a db/catalog prefix that should not be treated as schema.
+    """
+    parts = [part for part in str(name or "").split(".") if part]
+    if not parts:
+        return None, None
+    if len(parts) == 1:
+        return None, parts[0]
+    if len(parts) == 2:
+        return parts[0], parts[1]
+    return parts[-2], parts[-1]
 
 
 def _sanitize_identifier(identifier: Optional[str]) -> Optional[str]:
@@ -152,11 +174,22 @@ async def execute(
 
     column_relation_limit = context.scaled(context.column_relation_limit)
     value_limit = min(10, context.scaled(context.value_limit))
-    normalized_table_names = [
-        str(name).lower()
-        for name in table_names
-        if name is not None
-    ]
+    requested: List[Dict[str, Optional[str]]] = []
+    for raw in table_names:
+        raw_text = str(raw or "").strip()
+        if not raw_text:
+            continue
+        schema_part, table_part = _parse_requested_table_identifier(raw_text)
+        normalized_table = _normalize_lower(table_part)
+        if not normalized_table:
+            continue
+        requested.append(
+            {
+                "schema": _normalize_lower(schema_part) if schema_part else None,
+                "name": normalized_table,
+            }
+        )
+
     schema_hints = _build_schema_hints(table_names)
     db_metadata_cache: Dict[
         Tuple[str, str],
@@ -164,8 +197,14 @@ async def execute(
     ] = {}
 
     query = """
+    UNWIND $requested AS req
     MATCH (t:Table)
-    WHERE toLower(t.name) IN $normalized_table_names
+    WHERE (
+      (t.name IS NOT NULL AND toLower(t.name) = req.name)
+      OR (t.original_name IS NOT NULL AND toLower(t.original_name) = req.name)
+    )
+      AND (req.schema IS NULL OR (t.schema IS NOT NULL AND toLower(t.schema) = req.schema))
+    WITH DISTINCT t
     OPTIONAL MATCH (t)-[:HAS_COLUMN]->(c:Column)
     WITH t, c
     ORDER BY c.name
@@ -179,15 +218,27 @@ async def execute(
                description: c.description,
                is_primary_key: c.is_primary_key
            }) AS columns
+    ORDER BY table_schema, table_name
     """
 
     result = await context.neo4j_session.run(
         query,
-        normalized_table_names=normalized_table_names,
+        requested=requested,
     )
     records = await result.data()
 
     result_parts: List[str] = ["<tool_result>"]
+
+    if not records:
+        if requested:
+            result_parts.append("<warning>no_match</warning>")
+            result_parts.append(
+                "<hint>No matching tables found in the schema graph. "
+                "If multiple schemas may contain the same table name, specify schema.table. "
+                "Do NOT retry the exact same get_table_schema call; choose different tables or search again.</hint>"
+            )
+        result_parts.append("</tool_result>")
+        return "\n".join(result_parts)
 
     for record in records:
         table_name = record["table_name"]
@@ -267,7 +318,8 @@ async def execute(
                 context.neo4j_session,
                 table_name,
                 col_name,
-                limit=column_relation_limit,
+                column_relation_limit,
+                table_schema or None
             )
             if fk_relationships:
                 fk_relationships = sorted(

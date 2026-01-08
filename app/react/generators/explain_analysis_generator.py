@@ -10,11 +10,11 @@ from xml.sax.saxutils import escape as xml_escape
 
 import asyncpg
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
 
 from app.config import settings
 from app.core.sql_exec import SQLExecutionError, SQLExecutor
 from app.core.sql_guard import SQLGuard, SQLValidationError
+from app.react.llm_factory import create_react_llm
 from app.react.prompts import get_prompt_text
 from app.react.utils import XmlUtil
 from app.react.utils.db_query_builder import ExecutionPlanResult, get_query_builder, TableMetadata
@@ -253,20 +253,10 @@ class ExplainAnalysisResult:
 class ExplainAnalysisGenerator:
     """Generator that leverages explain_analysis_prompt to validate plans."""
 
-    def __init__(
-        self,
-        *,
-        llm: Optional[ChatOpenAI] = None,
-        db_type: Optional[str] = None,
-    ):
+    def __init__(self):
         self.prompt_text = get_prompt_text("explain_analysis_prompt.xml")
-        self.llm = llm or ChatOpenAI(
-            model=settings.react_openai_llm_model,
-            temperature=0,
-            api_key=settings.openai_api_key,
-            reasoning_effort="medium",
-        )
-        self.db_type = db_type or settings.target_db_type
+        self.llm = create_react_llm()
+        self.db_type = settings.target_db_type
 
     async def generate(
         self,
@@ -354,9 +344,7 @@ class ExplainAnalysisGenerator:
                 {
                     "react_run_id": react_run_id,
                     "model": getattr(self.llm, "model_name", None)
-                    or getattr(self.llm, "model", None)
-                    or settings.react_openai_llm_model,
-                    # System prompt 제외: input_xml(유저/시스템 상태 기반 입력)만 로깅
+                    or getattr(self.llm, "model", None),
                     "user_prompt": input_xml,
                 }
             ),

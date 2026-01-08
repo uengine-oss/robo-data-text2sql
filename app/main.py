@@ -19,7 +19,9 @@ async def lifespan(app: FastAPI):
     await neo4j_conn.connect()
     print(f"✓ Connected to Neo4j at {settings.neo4j_uri}")
     print(f"✓ Target database: {settings.target_db_type}://{settings.target_db_host}:{settings.target_db_port}/{settings.target_db_name}")
-    print(f"✓ Using LLM: {settings.openai_llm_model}")
+    print(f"✓ Using LLM for Ingest: {settings.openai_llm_model}")
+    print(f"✓ Using Embedding Model for Embedding Search: {settings.openai_embedding_model}")
+    print(f"✓ Using LLM for ReAct Agent: {settings.react_google_llm_model}")
     SmartLogger.log(
         "INFO",
         "🚀 Starting Neo4j Text2SQL API...",
