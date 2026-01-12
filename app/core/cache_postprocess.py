@@ -27,28 +27,21 @@ from app.smart_logger import SmartLogger
 from app.react.utils.log_sanitize import sanitize_for_log
 
 
-GENERIC_NATURAL_VALUE_STOPWORDS = {
-    "정수장",
-    "사업장",
-    "시설",
-    "지역",
-    "코드",
-    "수압",
-    "수압 코드",
-    "유량",
-    "평균",
-    "합계",
-    "최대",
-    "최소",
-    "전체",
-    "조회",
-    "검색",
-    "보여줘",
-    "알려줘",
-    "해주세요",
-    "데이터",
-    "값",
-}
+"""
+ValueMapping 정책 (Option C):
+- stopword 기반 차단은 사용하지 않는다.
+- 필요 시 스키마/테이블/컬럼별 allow/deny 정책으로 제어한다.
+  (현재 기본 정책은 "모든 컬럼 허용"이며, DB 존재성/컬럼해결 게이트가 품질을 보장한다.)
+"""
+
+# Optional: block specific columns if they create noise.
+# Keep empty by default.
+VALUE_MAPPING_COLUMN_NAME_DENYLIST = set()
+
+# Optional: allowlist/denylist by FQN regex.
+# If allowlist is non-empty, only matching FQNs are allowed.
+VALUE_MAPPING_COLUMN_FQN_ALLOWLIST_REGEX: List[str] = []
+VALUE_MAPPING_COLUMN_FQN_DENYLIST_REGEX: List[str] = []
 
 
 @dataclass
@@ -60,6 +53,24 @@ class ValueMappingCandidate:
     code_value: str
     confidence: float = 0.0
     evidence: str = ""
+
+
+def _candidate_brief(c: ValueMappingCandidate) -> Dict[str, Any]:
+    return {
+        "schema": c.schema,
+        "table": c.table,
+        "column": c.column,
+        "natural_value": c.natural_value,
+        "code_value": c.code_value,
+        "confidence": c.confidence,
+        "evidence": (c.evidence or "")[:200],
+    }
+
+
+def _append_sample(bucket: List[Dict[str, Any]], cand: ValueMappingCandidate, *, limit: int = 5) -> None:
+    if len(bucket) >= limit:
+        return
+    bucket.append(_candidate_brief(cand))
 
 
 async def process_cache_postprocess_payload(payload: Dict[str, Any]) -> None:
@@ -110,17 +121,49 @@ async def process_cache_postprocess_payload(payload: Dict[str, Any]) -> None:
             steps_summary=steps_summary,
         )
 
+        SmartLogger.log(
+            "INFO",
+            "cache_postprocess.value_mapping.candidates",
+            category="cache_postprocess.value_mapping",
+            params=sanitize_for_log(
+                {
+                    "react_run_id": react_run_id,
+                    "target_db_type": settings.target_db_type,
+                    "react_caching_db_type": settings.react_caching_db_type,
+                    "candidates_count": len(mapping_candidates),
+                    "candidates_sample": [_candidate_brief(c) for c in mapping_candidates[:5]],
+                }
+            ),
+            max_inline_chars=0,
+        )
+
         # 2) Strong gate: validate candidates against DB existence
         validated_mappings: List[ValueMappingCandidate] = []
+        reject_reason_counts = {
+            "policy_rejected": 0,
+            "resolve_column_failed": 0,
+            "value_not_in_db": 0,
+        }
+        reject_samples: Dict[str, List[Dict[str, Any]]] = {
+            "policy_rejected": [],
+            "resolve_column_failed": [],
+            "value_not_in_db": [],
+        }
         for cand in mapping_candidates:
-            if not _is_candidate_reasonable(question, cand):
+            if not _passes_value_mapping_policy(cand):
+                reject_reason_counts["policy_rejected"] += 1
+                _append_sample(reject_samples["policy_rejected"], cand)
                 continue
             resolved = await _resolve_column_case(db_conn, cand.schema, cand.table, cand.column)
             if not resolved:
+                reject_reason_counts["resolve_column_failed"] += 1
+                _append_sample(reject_samples["resolve_column_failed"], cand)
                 continue
             schema_real, table_real, column_real = resolved
             exists = await _value_exists_in_db(db_conn, schema_real, table_real, column_real, cand.code_value)
             if not exists:
+                reject_reason_counts["value_not_in_db"] += 1
+                _append_sample(reject_samples["value_not_in_db"], cand)
                 continue
             validated_mappings.append(
                 ValueMappingCandidate(
@@ -133,6 +176,22 @@ async def process_cache_postprocess_payload(payload: Dict[str, Any]) -> None:
                     evidence=cand.evidence,
                 )
             )
+
+        SmartLogger.log(
+            "INFO",
+            "cache_postprocess.value_mapping.validation_summary",
+            category="cache_postprocess.value_mapping",
+            params=sanitize_for_log(
+                {
+                    "react_run_id": react_run_id,
+                    "candidates_count": len(mapping_candidates),
+                    "validated_count": len(validated_mappings),
+                    "reject_reason_counts": reject_reason_counts,
+                    "reject_samples": reject_samples,
+                }
+            ),
+            max_inline_chars=0,
+        )
 
         # 3) Upsert Query + relationships + mappings
         repo = Neo4jQueryRepository(neo4j_session)
@@ -234,24 +293,47 @@ async def _open_db_connection() -> asyncpg.Connection:
     return conn
 
 
-def _is_candidate_reasonable(question: str, cand: ValueMappingCandidate) -> bool:
+def _passes_value_mapping_policy(cand: ValueMappingCandidate) -> bool:
     natural = (cand.natural_value or "").strip()
     code = (cand.code_value or "").strip()
     if not natural or not code:
         return False
     if len(natural) < 2:
         return False
-    if natural in GENERIC_NATURAL_VALUE_STOPWORDS:
-        return False
-    # Must appear in the original question text (stronger than contains in SQL).
-    if natural not in question:
-        return False
-    # Avoid mapping generic "...코드" phrases.
-    if natural.endswith("코드"):
-        return False
     # Avoid gigantic strings.
     if len(code) > 128 or len(natural) > 64:
         return False
+
+    col = (cand.column or "").strip()
+    if col and col.lower() in {c.lower() for c in VALUE_MAPPING_COLUMN_NAME_DENYLIST}:
+        return False
+
+    schema = (cand.schema or "").strip()
+    table = (cand.table or "").strip()
+    fqn = ".".join([p for p in [schema, table, col] if p])
+
+    # Denylist has priority.
+    for pat in VALUE_MAPPING_COLUMN_FQN_DENYLIST_REGEX:
+        try:
+            if re.search(pat, fqn, flags=re.IGNORECASE):
+                return False
+        except re.error:
+            # Bad regex should not break runtime; ignore.
+            continue
+
+    # If allowlist is set, require at least one match.
+    if VALUE_MAPPING_COLUMN_FQN_ALLOWLIST_REGEX:
+        ok = False
+        for pat in VALUE_MAPPING_COLUMN_FQN_ALLOWLIST_REGEX:
+            try:
+                if re.search(pat, fqn, flags=re.IGNORECASE):
+                    ok = True
+                    break
+            except re.error:
+                continue
+        if not ok:
+            return False
+
     return True
 
 
@@ -381,7 +463,7 @@ async def _llm_extract_value_mappings(
         "steps_summary_json": steps_summary,
         "task": (
             "질문에서 사용자가 말한 자연어 값(natural_value)과 SQL/메타데이터에 사용된 코드/식별자(code_value)를 찾아 "
-            "ValueMapping 후보를 생성하세요. 반드시 질문에 실제로 등장한 자연어만 natural_value로 사용하세요."
+            "ValueMapping 후보를 생성하세요."
         ),
         "output_schema": {
             "type": "array",
@@ -421,6 +503,19 @@ async def _llm_extract_value_mappings(
     try:
         arr = json.loads(text)
     except Exception:
+        SmartLogger.log(
+            "WARNING",
+            "cache_postprocess.value_mapping.llm_parse_failed",
+            category="cache_postprocess.value_mapping",
+            params=sanitize_for_log(
+                {
+                    "model": settings.openai_llm_model,
+                    "text_len": len(text),
+                    "text_head": text[:500],
+                }
+            ),
+            max_inline_chars=0,
+        )
         arr = []
 
     candidates: List[ValueMappingCandidate] = []

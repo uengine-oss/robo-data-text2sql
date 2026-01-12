@@ -561,12 +561,14 @@ class Neo4jQueryRepository:
             max_inline_chars=0,
         )
         try:
-            await self.session.run(
+            result = await self.session.run(
                 cypher,
                 natural_value=natural_value,
                 code_value=code_value,
                 column_fqn=column_fqn,
             )
+            summary = await result.consume()
+            counters = summary.counters
             SmartLogger.log(
                 "INFO",
                 "neo4j_history.save_value_mapping_by_fqn.done",
@@ -576,11 +578,34 @@ class Neo4jQueryRepository:
                         "natural_value": natural_value,
                         "code_value": code_value,
                         "column_fqn": column_fqn,
+                        "neo4j_contains_updates": bool(counters.contains_updates),
+                        "neo4j_counters": {
+                            "nodes_created": counters.nodes_created,
+                            "nodes_deleted": counters.nodes_deleted,
+                            "relationships_created": counters.relationships_created,
+                            "relationships_deleted": counters.relationships_deleted,
+                            "properties_set": counters.properties_set,
+                        },
                         "elapsed_ms": (time.perf_counter() - started) * 1000.0,
                     }
                 ),
                 max_inline_chars=0,
             )
+            if not counters.contains_updates:
+                SmartLogger.log(
+                    "WARNING",
+                    "neo4j_history.save_value_mapping_by_fqn.no_update",
+                    category="neo4j.history.save_value_mapping",
+                    params=sanitize_for_log(
+                        {
+                            "natural_value": natural_value,
+                            "code_value": code_value,
+                            "column_fqn": column_fqn,
+                            "reason_hint": "MATCH (c:Column {fqn}) returned no rows, so MERGE didn't run.",
+                        }
+                    ),
+                    max_inline_chars=0,
+                )
         except Exception as exc:
             SmartLogger.log(
                 "ERROR",
@@ -636,12 +661,14 @@ class Neo4jQueryRepository:
 
         try:
             # 컬럼 찾기 및 매핑 저장
-            await self.session.run(
+            result = await self.session.run(
                 cypher,
                 natural_value=natural_value,
                 code_value=code_value,
                 column_name=column_name.lower(),
             )
+            summary = await result.consume()
+            counters = summary.counters
             SmartLogger.log(
                 "INFO",
                 "neo4j_history.save_value_mapping.done",
@@ -651,11 +678,34 @@ class Neo4jQueryRepository:
                         "natural_value": natural_value,
                         "code_value": code_value,
                         "column_name": column_name,
+                        "neo4j_contains_updates": bool(counters.contains_updates),
+                        "neo4j_counters": {
+                            "nodes_created": counters.nodes_created,
+                            "nodes_deleted": counters.nodes_deleted,
+                            "relationships_created": counters.relationships_created,
+                            "relationships_deleted": counters.relationships_deleted,
+                            "properties_set": counters.properties_set,
+                        },
                         "elapsed_ms": (time.perf_counter() - started) * 1000.0,
                     }
                 ),
                 max_inline_chars=0,
             )
+            if not counters.contains_updates:
+                SmartLogger.log(
+                    "WARNING",
+                    "neo4j_history.save_value_mapping.no_update",
+                    category="neo4j.history.save_value_mapping",
+                    params=sanitize_for_log(
+                        {
+                            "natural_value": natural_value,
+                            "code_value": code_value,
+                            "column_name": column_name,
+                            "reason_hint": "MATCH (c:Column {name}) returned no rows, so MERGE didn't run.",
+                        }
+                    ),
+                    max_inline_chars=0,
+                )
         except Exception as exc:
             SmartLogger.log(
                 "ERROR",
