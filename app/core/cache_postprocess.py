@@ -279,12 +279,15 @@ async def process_cache_postprocess_payload(payload: Dict[str, Any]) -> None:
 
 
 async def _open_db_connection() -> asyncpg.Connection:
+    # SSL mode: 'disable' -> ssl=False, other values passed as ssl parameter
+    ssl_mode = settings.target_db_ssl if settings.target_db_ssl != "disable" else False
     conn = await asyncpg.connect(
         host=settings.target_db_host,
         port=settings.target_db_port,
         database=settings.target_db_name,
         user=settings.target_db_user,
         password=settings.target_db_password,
+        ssl=ssl_mode,
     )
     schemas = settings.target_db_schemas.split(",")
     schemas_str = ", ".join(s.strip() for s in schemas if s.strip())

@@ -108,9 +108,9 @@ async def list_table_columns(
         ColumnInfo(
             name=r["name"],
             table_name=r["table_name"],
-            dtype=r["dtype"],
-            nullable=r.get("nullable", True),
-            description=r.get("description", "")
+            dtype=r.get("dtype") or "unknown",
+            nullable=r.get("nullable") if r.get("nullable") is not None else True,
+            description=r.get("description") or ""
         )
         for r in records
     ]
@@ -145,9 +145,9 @@ async def search_columns(
         ColumnInfo(
             name=r["name"],
             table_name=r["table_name"],
-            dtype=r["dtype"],
-            nullable=r.get("nullable", True),
-            description=r.get("description", "")
+            dtype=r.get("dtype") or "unknown",
+            nullable=r.get("nullable") if r.get("nullable") is not None else True,
+            description=r.get("description") or ""
         )
         for r in records
     ]

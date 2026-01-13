@@ -44,9 +44,23 @@ class GraphSearcher:
         self.top_k = settings.vector_top_k
         self.max_hops = settings.max_fk_hops
     
-    async def search_tables(self, query_embedding: List[float], k: int = None) -> List[TableMatch]:
-        """Search for relevant tables using vector similarity"""
+    async def search_tables(
+        self,
+        query_embedding: List[float],
+        k: int = None,
+        schema_filter: List[str] = None
+    ) -> List[TableMatch]:
+        """Search for relevant tables using vector similarity
+        
+        Args:
+            query_embedding: Vector embedding of the query
+            k: Number of results to return
+            schema_filter: Optional list of schemas to include (e.g., ["dw"] for OLAP only)
+        """
         k = k or self.top_k
+        
+        # Use a higher k for initial fetch if filtering
+        fetch_k = k * 3 if schema_filter else k
         
         query = """
         CALL db.index.vector.queryNodes('table_vec_index', $k, $embedding)
@@ -59,10 +73,10 @@ class GraphSearcher:
         ORDER BY score DESC, node.schema ASC, name ASC
         """
         
-        result = await self.session.run(query, k=k, embedding=query_embedding)
+        result = await self.session.run(query, k=fetch_k, embedding=query_embedding)
         records = await result.data()
         
-        return [
+        matches = [
             TableMatch(
                 name=r["name"],
                 schema=r["schema"],
@@ -72,10 +86,34 @@ class GraphSearcher:
             )
             for r in records
         ]
+        
+        # Apply schema filter if provided
+        if schema_filter:
+            schema_filter_lower = [s.lower() for s in schema_filter]
+            matches = [
+                m for m in matches
+                if m.schema and m.schema.lower() in schema_filter_lower
+            ]
+        
+        return matches[:k]
     
-    async def search_columns(self, query_embedding: List[float], k: int = None) -> List[ColumnMatch]:
-        """Search for relevant columns using vector similarity"""
+    async def search_columns(
+        self,
+        query_embedding: List[float],
+        k: int = None,
+        schema_filter: List[str] = None
+    ) -> List[ColumnMatch]:
+        """Search for relevant columns using vector similarity
+        
+        Args:
+            query_embedding: Vector embedding of the query
+            k: Number of results to return
+            schema_filter: Optional list of schemas to include
+        """
         k = k or self.top_k
+        
+        # Use a higher k for initial fetch if filtering
+        fetch_k = k * 3 if schema_filter else k
         
         query = """
         CALL db.index.vector.queryNodes('column_vec_index', $k, $embedding)
@@ -83,6 +121,7 @@ class GraphSearcher:
         MATCH (t:Table)-[:HAS_COLUMN]->(node)
         RETURN node.name AS name,
                t.name AS table_name,
+               t.schema AS table_schema,
                node.dtype AS dtype,
                node.description AS description,
                node.nullable AS nullable,
@@ -90,10 +129,10 @@ class GraphSearcher:
         ORDER BY score DESC, t.name ASC, node.name ASC
         """
         
-        result = await self.session.run(query, k=k, embedding=query_embedding)
+        result = await self.session.run(query, k=fetch_k, embedding=query_embedding)
         records = await result.data()
         
-        return [
+        matches = [
             ColumnMatch(
                 name=r["name"],
                 table_name=r["table_name"],
@@ -103,7 +142,13 @@ class GraphSearcher:
                 score=r["score"]
             )
             for r in records
+            if not schema_filter or (
+                r.get("table_schema") and 
+                r.get("table_schema").lower() in [s.lower() for s in schema_filter]
+            )
         ]
+        
+        return matches[:k]
     
     async def find_fk_paths(self, table_names: List[str]) -> List[Dict[str, Any]]:
         """Find foreign key relationships between tables"""

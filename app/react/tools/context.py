@@ -1,5 +1,5 @@
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Optional, List
 
 import asyncpg
 from neo4j import AsyncSession
@@ -33,6 +33,9 @@ class ToolContext:
     search_column_values_search_keywords_limit: int = 10
 
     max_sql_seconds: int = 60
+    
+    # Schema filter for limiting search to specific schemas (e.g., ["dw"] for OLAP only)
+    schema_filter: Optional[List[str]] = None
 
     def scaled(self, value: int) -> int:
         """TOOL_POWER_LEVEL 을 적용한 정수 값을 반환한다."""
@@ -51,6 +54,7 @@ class ToolContext:
         get_table_schema_table_name_limit: Optional[int] = None,
         search_column_values_search_keywords_limit: Optional[int] = None,
         max_sql_seconds: Optional[int] = None,
+        schema_filter: Optional[List[str]] = None,
     ) -> "ToolContext":
         """필요시 일부 파라미터를 오버라이드한 새로운 컨텍스트를 생성한다."""
         return ToolContext(
@@ -68,5 +72,6 @@ class ToolContext:
             get_table_schema_table_name_limit=get_table_schema_table_name_limit or self.get_table_schema_table_name_limit,
             search_column_values_search_keywords_limit=search_column_values_search_keywords_limit or self.search_column_values_search_keywords_limit,
             max_sql_seconds=max_sql_seconds or self.max_sql_seconds,
+            schema_filter=schema_filter if schema_filter is not None else self.schema_filter,
         )
 

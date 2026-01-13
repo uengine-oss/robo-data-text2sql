@@ -39,7 +39,11 @@ async def execute(
         return f"{schema}.{name}" if schema else name
 
     for keyword, embedding in zip(keywords, query_embeddings):
-        matches = await searcher.search_tables(embedding, k=table_fetch_limit)
+        matches = await searcher.search_tables(
+            embedding,
+            k=table_fetch_limit,
+            schema_filter=context.schema_filter
+        )
         filtered_matches = [
             match
             for match in matches

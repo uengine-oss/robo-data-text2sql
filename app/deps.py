@@ -64,12 +64,15 @@ async def get_neo4j_session():
 
 async def get_db_connection() -> AsyncGenerator[asyncpg.Connection, None]:
     """FastAPI dependency for target database connection"""
+    # SSL mode: 'disable' -> ssl=False, other values passed as ssl parameter
+    ssl_mode = settings.target_db_ssl if settings.target_db_ssl != "disable" else False
     conn = await asyncpg.connect(
         host=settings.target_db_host,
         port=settings.target_db_port,
         database=settings.target_db_name,
         user=settings.target_db_user,
         password=settings.target_db_password,
+        ssl=ssl_mode,
     )
     try:
         # Set search_path to include all configured schemas (public, dw, etc.)

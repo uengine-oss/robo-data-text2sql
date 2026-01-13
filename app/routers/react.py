@@ -104,6 +104,9 @@ class ReactRequest(BaseModel):
     use_cache: bool = Field(
         default=True, description="동일한 질문에 대해 캐시된 결과를 사용할지 여부"
     )
+    schema_filter: Optional[List[str]] = Field(
+        default=None, description="검색 대상 스키마 제한 (예: ['dw']는 OLAP 데이터만 검색)"
+    )
 
 
 def _step_to_model(step: ReactStep) -> ReactStepModel:
@@ -226,6 +229,7 @@ async def run_react(
         openai_client=openai_client,
         react_run_id=react_run_id,
         max_sql_seconds=state.max_sql_seconds,
+        schema_filter=request.schema_filter,
     )
 
     agent = ReactAgent()

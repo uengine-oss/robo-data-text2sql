@@ -20,7 +20,12 @@ class Settings(BaseSettings):
     llm_cache_path: str = ".cache/llm_cache.db"
 
     # ReAct Agent
-    google_api_key: str
+    # LLM Provider: "openai" or "google" (auto-detected if not set)
+    react_llm_provider: str = ""  # Empty = auto-detect based on API keys
+    # OpenAI settings for ReAct (used when react_llm_provider="openai")
+    react_openai_llm_model: str = "gpt-4.1"  # or gpt-4.1-mini, o4-mini, etc.
+    # Google settings for ReAct (used when react_llm_provider="google")
+    google_api_key: str = ""  # Optional, can be empty if using OpenAI
     react_google_llm_model: str = "gemini-3-flash-preview"
     is_add_delay_after_react_generator: bool = False
     delay_after_react_generator_seconds: int = 5
@@ -38,6 +43,7 @@ class Settings(BaseSettings):
     target_db_password: str
     target_db_schema: str = "public"
     target_db_schemas: str = "public,dw"  # Comma-separated list of schemas to access
+    target_db_ssl: str = "disable"  # SSL mode: disable, require, verify-ca, verify-full
     
     # API
     api_host: str = "0.0.0.0"
