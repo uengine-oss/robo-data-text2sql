@@ -42,7 +42,7 @@ class Settings(BaseSettings):
     target_db_user: str
     target_db_password: str
     target_db_schema: str = "public"
-    target_db_schemas: str = "public,dw"  # Comma-separated list of schemas to access
+    target_db_schemas: str = "public"  # Comma-separated list of schemas to access
     target_db_ssl: str = "disable"  # SSL mode: disable, require, verify-ca, verify-full
     
     # API

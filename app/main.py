@@ -11,12 +11,15 @@ from app.deps import neo4j_conn
 from app.routers import ask, meta, feedback, ingest, react, vectorize, history, cache, direct_sql
 from app.smart_logger import SmartLogger
 from app.core.background_jobs import start_cache_postprocess_workers, stop_cache_postprocess_workers
+from app.sanity_checks.runner import run_startup_sanity_checks_or_raise
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown events"""
     # Startup
     print("🚀 Starting Neo4j Text2SQL API...")
+    # Fail-fast sanity checks (external dependencies)
+    await run_startup_sanity_checks_or_raise()
     await neo4j_conn.connect()
     print(f"✓ Connected to Neo4j at {settings.neo4j_uri}")
     print(f"✓ Target database: {settings.target_db_type}://{settings.target_db_host}:{settings.target_db_port}/{settings.target_db_name}")
