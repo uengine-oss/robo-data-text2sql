@@ -107,6 +107,16 @@ class ReactRequest(BaseModel):
     schema_filter: Optional[List[str]] = Field(
         default=None, description="검색 대상 스키마 제한 (예: ['dw']는 OLAP 데이터만 검색)"
     )
+    object_type_only: bool = Field(
+        default=False, description="ObjectType(Materialized View) 테이블만 검색 (도메인 레이어 모드)"
+    )
+    linked_object_types: Optional[List[Dict[str, Any]]] = Field(
+        default=None, 
+        description="연결된 ObjectType 정보. 프롬프트 확장에 사용. [{name, columns: [{name, type}], description}]"
+    )
+    prefer_formula: bool = Field(
+        default=False, description="계리수식/공식 우선 검색 모드. True일 경우 수식 컬럼과 계산식을 우선 탐색"
+    )
 
 
 def _step_to_model(step: ReactStep) -> ReactStepModel:
@@ -230,6 +240,9 @@ async def run_react(
         react_run_id=react_run_id,
         max_sql_seconds=state.max_sql_seconds,
         schema_filter=request.schema_filter,
+        object_type_only=request.object_type_only,
+        linked_object_types=request.linked_object_types,  # 연결된 ObjectType 정보 추가
+        prefer_formula=request.prefer_formula,  # 계리수식 우선 검색 모드
     )
 
     agent = ReactAgent()

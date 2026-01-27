@@ -28,6 +28,25 @@ class DirectSqlRequest(BaseModel):
     format_with_ai: bool = Field(default=False, description="AI로 결과 포맷팅 여부")
 
 
+class CreateMaterializedViewRequest(BaseModel):
+    """Materialized View 생성 요청"""
+    view_name: str = Field(..., description="생성할 뷰 이름", pattern=r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+    schema_name: str = Field(default="public", description="스키마 이름")
+    source_sql: str = Field(..., description="뷰의 기반 SQL 쿼리")
+    refresh_on_create: bool = Field(default=True, description="생성 후 즉시 데이터 로드")
+    description: str = Field(default="", description="뷰 설명")
+
+
+class MaterializedViewResponse(BaseModel):
+    """Materialized View 생성 결과"""
+    status: str  # success, error
+    view_name: str
+    full_name: str  # schema.view_name
+    row_count: int = 0
+    message: str = ""
+    error_message: Optional[str] = None
+
+
 class DirectSqlResponse(BaseModel):
     status: str  # success, error
     sql: str
@@ -102,11 +121,19 @@ async def execute_direct_sql(
             category="direct_sql.execution_error",
             params={"error": str(exc)},
         )
+        # 친절한 오류 메시지 생성
+        error_msg = f"SQL 실행 실패: {exc}"
+        error_str = str(exc).lower()
+        
+        # 연결 끊김 오류에 대한 추가 안내
+        if "lost connection" in error_str or "connection" in error_str:
+            error_msg += "\n\n💡 팁: 대용량 데이터 조회 시 연결이 끊어질 수 있습니다. LIMIT 절을 추가하여 조회 건수를 제한해 보세요. (예: LIMIT 100)"
+        
         return DirectSqlResponse(
             status="error",
             sql=request.sql,
             validated_sql=validated_sql,
-            error_message=f"SQL 실행 실패: {exc}"
+            error_message=error_msg
         )
     
     # 3. AI 포맷팅 (선택적)
@@ -245,7 +272,15 @@ async def execute_direct_sql_stream(
             yield json.dumps(result_payload, ensure_ascii=False, default=str) + "\n"
             
         except SQLExecutionError as exc:
-            yield json.dumps({"event": "error", "message": f"SQL 실행 실패: {exc}"}, ensure_ascii=False) + "\n"
+            # 친절한 오류 메시지 생성
+            error_msg = f"SQL 실행 실패: {exc}"
+            error_str = str(exc).lower()
+            
+            # 연결 끊김 오류에 대한 추가 안내
+            if "lost connection" in error_str or "connection" in error_str:
+                error_msg += "\n\n💡 팁: 대용량 데이터 조회 시 연결이 끊어질 수 있습니다. LIMIT 절을 추가하여 조회 건수를 제한해 보세요. (예: LIMIT 100)"
+            
+            yield json.dumps({"event": "error", "message": error_msg}, ensure_ascii=False) + "\n"
             return
         
         # 3. AI 포맷팅 (선택적)
@@ -312,4 +347,180 @@ SQL:
         yield json.dumps({"event": "completed"}, ensure_ascii=False) + "\n"
     
     return StreamingResponse(event_generator(), media_type="application/x-ndjson")
+
+
+@router.post("/materialized-view", response_model=MaterializedViewResponse)
+async def create_materialized_view(
+    request: CreateMaterializedViewRequest,
+    db_conn=Depends(get_db_connection),
+) -> MaterializedViewResponse:
+    """
+    Materialized View를 생성합니다.
+    
+    - 기존 뷰가 있으면 삭제 후 재생성
+    - 소스 SQL의 읽기 전용 검증
+    - 생성 후 데이터 로드 (선택적)
+    """
+    
+    SmartLogger.log(
+        "INFO",
+        "direct_sql.create_mv.request",
+        category="direct_sql.create_mv",
+        params={
+            "view_name": request.view_name,
+            "schema_name": request.schema_name,
+        },
+    )
+    
+    # 1. 소스 SQL 검증 (SELECT 문인지 확인)
+    guard = SQLGuard()
+    try:
+        validated_sql, _ = guard.validate(request.source_sql)
+    except SQLValidationError as exc:
+        return MaterializedViewResponse(
+            status="error",
+            view_name=request.view_name,
+            full_name=f"{request.schema_name}.{request.view_name}",
+            error_message=f"소스 SQL 검증 실패: {exc}"
+        )
+    
+    full_view_name = f'"{request.schema_name}"."{request.view_name}"'
+    
+    try:
+        # 2. 기존 뷰 삭제 (있으면)
+        drop_sql = f"DROP MATERIALIZED VIEW IF EXISTS {full_view_name} CASCADE"
+        await db_conn.execute(drop_sql)
+        
+        # 3. Materialized View 생성
+        create_sql = f"""
+        CREATE MATERIALIZED VIEW {full_view_name} AS
+        {validated_sql}
+        {"" if request.refresh_on_create else "WITH NO DATA"}
+        """
+        await db_conn.execute(create_sql)
+        
+        # 4. 설명 추가 (있으면)
+        if request.description:
+            comment_sql = f"COMMENT ON MATERIALIZED VIEW {full_view_name} IS $1"
+            await db_conn.execute(comment_sql, request.description)
+        
+        # 5. 데이터 개수 확인
+        row_count = 0
+        if request.refresh_on_create:
+            count_sql = f"SELECT COUNT(*) FROM {full_view_name}"
+            row_count = await db_conn.fetchval(count_sql)
+        
+        SmartLogger.log(
+            "INFO",
+            "direct_sql.create_mv.success",
+            category="direct_sql.create_mv",
+            params={
+                "view_name": request.view_name,
+                "row_count": row_count,
+            },
+        )
+        
+        return MaterializedViewResponse(
+            status="success",
+            view_name=request.view_name,
+            full_name=f"{request.schema_name}.{request.view_name}",
+            row_count=row_count,
+            message=f"Materialized View '{request.view_name}' 생성 완료 ({row_count}개 행)"
+        )
+        
+    except Exception as exc:
+        SmartLogger.log(
+            "ERROR",
+            "direct_sql.create_mv.error",
+            category="direct_sql.create_mv",
+            params={"error": str(exc)},
+        )
+        return MaterializedViewResponse(
+            status="error",
+            view_name=request.view_name,
+            full_name=f"{request.schema_name}.{request.view_name}",
+            error_message=f"Materialized View 생성 실패: {exc}"
+        )
+
+
+@router.post("/materialized-view/{view_name}/refresh")
+async def refresh_materialized_view(
+    view_name: str,
+    schema_name: str = "public",
+    db_conn=Depends(get_db_connection),
+) -> dict:
+    """Materialized View 데이터 갱신"""
+    
+    full_view_name = f'"{schema_name}"."{view_name}"'
+    
+    try:
+        # REFRESH
+        refresh_sql = f"REFRESH MATERIALIZED VIEW {full_view_name}"
+        await db_conn.execute(refresh_sql)
+        
+        # 새 데이터 개수
+        count_sql = f"SELECT COUNT(*) FROM {full_view_name}"
+        row_count = await db_conn.fetchval(count_sql)
+        
+        return {
+            "status": "success",
+            "view_name": view_name,
+            "row_count": row_count,
+            "message": f"Materialized View '{view_name}' 갱신 완료 ({row_count}개 행)"
+        }
+        
+    except Exception as exc:
+        return {
+            "status": "error",
+            "view_name": view_name,
+            "error_message": f"갱신 실패: {exc}"
+        }
+
+
+@router.get("/materialized-views")
+async def list_materialized_views(
+    schema_name: str = "public",
+    db_conn=Depends(get_db_connection),
+) -> dict:
+    """Materialized View 목록 조회"""
+    
+    try:
+        query = """
+        SELECT 
+            schemaname,
+            matviewname,
+            matviewowner,
+            ispopulated,
+            pg_size_pretty(pg_total_relation_size(schemaname || '.' || matviewname)) as size,
+            obj_description((schemaname || '.' || matviewname)::regclass) as description
+        FROM pg_matviews
+        WHERE schemaname = $1
+        ORDER BY matviewname
+        """
+        rows = await db_conn.fetch(query, schema_name)
+        
+        views = [
+            {
+                "schema": row["schemaname"],
+                "name": row["matviewname"],
+                "owner": row["matviewowner"],
+                "is_populated": row["ispopulated"],
+                "size": row["size"],
+                "description": row["description"]
+            }
+            for row in rows
+        ]
+        
+        return {
+            "status": "success",
+            "views": views,
+            "count": len(views)
+        }
+        
+    except Exception as exc:
+        return {
+            "status": "error",
+            "views": [],
+            "error_message": str(exc)
+        }
 

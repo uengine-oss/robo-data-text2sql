@@ -1,12 +1,18 @@
 """Dependency injection for FastAPI"""
 import os
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Union
 from neo4j import AsyncGraphDatabase, AsyncDriver
 import asyncpg
 from openai import AsyncOpenAI
 from langchain_community.cache import SQLiteCache
 from langchain_core.globals import set_llm_cache
 
+# MySQL support
+try:
+    import aiomysql
+    MYSQL_AVAILABLE = True
+except ImportError:
+    MYSQL_AVAILABLE = False
 
 from app.config import settings
 
@@ -62,26 +68,49 @@ async def get_neo4j_session():
         await session.close()
 
 
-async def get_db_connection() -> AsyncGenerator[asyncpg.Connection, None]:
-    """FastAPI dependency for target database connection"""
-    # SSL mode: 'disable' -> ssl=False, other values passed as ssl parameter
-    ssl_mode = settings.target_db_ssl if settings.target_db_ssl != "disable" else False
-    conn = await asyncpg.connect(
-        host=settings.target_db_host,
-        port=settings.target_db_port,
-        database=settings.target_db_name,
-        user=settings.target_db_user,
-        password=settings.target_db_password,
-        ssl=ssl_mode,
-    )
-    try:
-        # Set search_path to include all configured schemas (public, dw, etc.)
-        schemas = settings.target_db_schemas.split(',')
-        schemas_str = ', '.join(s.strip() for s in schemas)
-        await conn.execute(f"SET search_path TO {schemas_str}")
-        yield conn
-    finally:
-        await conn.close()
+async def get_db_connection() -> AsyncGenerator[Union[asyncpg.Connection, "aiomysql.Connection"], None]:
+    """FastAPI dependency for target database connection
+    
+    Supports both PostgreSQL (asyncpg) and MySQL (aiomysql) connections
+    based on TARGET_DB_TYPE setting.
+    """
+    db_type = settings.target_db_type.lower()
+    
+    if db_type == "mysql":
+        if not MYSQL_AVAILABLE:
+            raise RuntimeError("aiomysql is not installed. Run: pip install aiomysql")
+        
+        conn = await aiomysql.connect(
+            host=settings.target_db_host,
+            port=settings.target_db_port,
+            db=settings.target_db_name,
+            user=settings.target_db_user,
+            password=settings.target_db_password or "",
+            autocommit=True,
+        )
+        try:
+            yield conn
+        finally:
+            conn.close()
+    else:
+        # PostgreSQL (default)
+        ssl_mode = settings.target_db_ssl if settings.target_db_ssl != "disable" else False
+        conn = await asyncpg.connect(
+            host=settings.target_db_host,
+            port=settings.target_db_port,
+            database=settings.target_db_name,
+            user=settings.target_db_user,
+            password=settings.target_db_password,
+            ssl=ssl_mode,
+        )
+        try:
+            # Set search_path to include all configured schemas (public, dw, etc.)
+            schemas = settings.target_db_schemas.split(',')
+            schemas_str = ', '.join(s.strip() for s in schemas)
+            await conn.execute(f"SET search_path TO {schemas_str}")
+            yield conn
+        finally:
+            await conn.close()
 
 
 async def get_openai_client():

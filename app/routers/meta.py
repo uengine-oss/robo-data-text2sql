@@ -15,6 +15,7 @@ class TableInfo(BaseModel):
     schema: str
     description: str
     column_count: int
+    datasource: Optional[str] = None  # 데이터 소스 이름 (예: mysql_jjy)
 
 
 class ColumnInfo(BaseModel):
@@ -46,6 +47,7 @@ async def list_tables(
         WITH t, count(c) AS col_count
         RETURN t.name AS name,
                t.schema AS schema,
+               coalesce(t.datasource, '') AS datasource,
                t.description AS description,
                col_count AS column_count
         ORDER BY name
@@ -60,6 +62,7 @@ async def list_tables(
         WITH t, count(c) AS col_count
         RETURN t.name AS name,
                t.schema AS schema,
+               coalesce(t.datasource, '') AS datasource,
                t.description AS description,
                col_count AS column_count
         ORDER BY name
@@ -75,6 +78,7 @@ async def list_tables(
         TableInfo(
             name=r["name"],
             schema=r["schema"],
+            datasource=r.get("datasource") or None,
             description=(r.get("description") or ""),
             column_count=r["column_count"]
         )

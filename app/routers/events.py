@@ -19,7 +19,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Request
 from pydantic import BaseModel, Field
 
 from app.config import settings
@@ -1325,8 +1325,6 @@ async def stream_alarms(request: Request):
     
     클라이언트가 이 엔드포인트에 연결하면 실시간으로 알람을 받습니다.
     """
-    from starlette.requests import Request
-    
     queue = asyncio.Queue()
     _alarm_subscribers.append(queue)
     

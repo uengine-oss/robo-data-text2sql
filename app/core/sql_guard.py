@@ -48,10 +48,20 @@ class SQLGuard:
         # Check for dangerous patterns
         self._check_dangerous_patterns(sql)
         
-        # Parse SQL
+        # MindsDB 쿼리 감지 (3-part 식별자: datasource.schema.table)
+        is_mindsdb_query = self._is_mindsdb_query(sql)
+        
+        # Parse SQL - MindsDB 쿼리는 mysql 방언 사용 (더 관대함)
         try:
-            parsed = sqlglot.parse_one(sql, read="postgres")
+            dialect = "mysql" if is_mindsdb_query else "postgres"
+            parsed = sqlglot.parse_one(sql, read=dialect)
         except Exception as e:
+            # 파싱 실패 시 기본 검증만 수행하고 원본 SQL 사용
+            if is_mindsdb_query:
+                # MindsDB 쿼리는 기본 검증만 통과하면 허용
+                if not sql.strip().upper().startswith("SELECT"):
+                    raise SQLValidationError("Only SELECT statements are allowed")
+                return self._ensure_limit_simple(sql), True
             raise SQLValidationError(f"Failed to parse SQL: {str(e)}")
         
         # Check if it's a SELECT statement
@@ -71,10 +81,40 @@ class SQLGuard:
         if allowed_tables:
             self._check_allowed_tables(parsed, allowed_tables)
         
-        # Ensure LIMIT clause
-        sql_with_limit = self._ensure_limit(sql, parsed)
+        # Ensure LIMIT clause - MindsDB 쿼리는 원본 SQL 유지
+        if is_mindsdb_query:
+            sql_with_limit = self._ensure_limit_simple(sql)
+        else:
+            sql_with_limit = self._ensure_limit(sql, parsed)
         
         return sql_with_limit, True
+    
+    def _is_mindsdb_query(self, sql: str) -> bool:
+        """MindsDB federated 쿼리인지 감지 (3-part 식별자 패턴)"""
+        # 패턴: datasource.schema.table 또는 datasource.table
+        # 예: posgres.rwis."AAA", mysql_full.common_db.customers, posgres.`RWIS`.`AAA`
+        # 백틱(`) 또는 큰따옴표(") 또는 일반 식별자 지원
+        pattern = r'\bFROM\s+\w+\.[\w`"]+\.[\w`"\']+' 
+        return bool(re.search(pattern, sql, re.IGNORECASE))
+    
+    def _ensure_limit_simple(self, sql: str) -> str:
+        """원본 SQL을 유지하면서 LIMIT만 추가 (MindsDB용)"""
+        sql_upper = sql.upper()
+        if "LIMIT" not in sql_upper:
+            return f"{sql.rstrip(';')} LIMIT {self.max_limit}"
+        else:
+            # 기존 LIMIT 값이 max_limit보다 크면 교체
+            match = re.search(r'\bLIMIT\s+(\d+)\b', sql, re.IGNORECASE)
+            if match:
+                limit_val = int(match.group(1))
+                if limit_val > self.max_limit:
+                    return re.sub(
+                        r'\bLIMIT\s+\d+\b',
+                        f'LIMIT {self.max_limit}',
+                        sql,
+                        flags=re.IGNORECASE
+                    )
+        return sql
     
     def _check_dangerous_patterns(self, sql: str):
         """Check for dangerous SQL patterns"""

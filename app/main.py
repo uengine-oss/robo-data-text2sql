@@ -12,6 +12,7 @@ from app.routers import ask, meta, feedback, ingest, react, vectorize, history, 
 from app.smart_logger import SmartLogger
 from app.core.background_jobs import start_cache_postprocess_workers, stop_cache_postprocess_workers
 from app.sanity_checks.runner import run_startup_sanity_checks_or_raise
+from app.models.explain_cache import ExplainCacheRepository
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -22,6 +23,15 @@ async def lifespan(app: FastAPI):
     await run_startup_sanity_checks_or_raise()
     await neo4j_conn.connect()
     print(f"✓ Connected to Neo4j at {settings.neo4j_uri}")
+    
+    # ExplainCache 인덱스 초기화
+    if settings.explain_cache_enabled and neo4j_conn.driver:
+        try:
+            explain_cache_repo = ExplainCacheRepository(neo4j_conn.driver)
+            await explain_cache_repo.ensure_indexes()
+            print(f"✓ ExplainCache indexes initialized (cost_threshold: {settings.explain_cache_cost_threshold})")
+        except Exception as e:
+            print(f"⚠ ExplainCache index initialization failed: {e}")
     print(f"✓ Target database: {settings.target_db_type}://{settings.target_db_host}:{settings.target_db_port}/{settings.target_db_name}")
     print(f"✓ Using LLM for Ingest: {settings.openai_llm_model}")
     print(f"✓ Using Embedding Model for Embedding Search: {settings.openai_embedding_model}")
@@ -108,6 +118,8 @@ app.include_router(event_templates.router, prefix="/text2sql")
 # Include watch agent router
 from app.routers import watch_agent
 app.include_router(watch_agent.router, prefix="/text2sql")
+
+# Note: Security router moved to data-secure-guard project (port 8001)
 
 
 @app.get("/")

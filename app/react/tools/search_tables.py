@@ -1,5 +1,6 @@
 from typing import Any, Dict, List, Optional, Set
 
+from app.config import settings
 from app.core.embedding import EmbeddingClient
 from app.core.graph_search import GraphSearcher, TableMatch
 from app.react.tools.context import ToolContext
@@ -9,15 +10,81 @@ from app.react.tools.neo4j_utils import (
 )
 
 
+async def _fetch_table_columns(
+    neo4j_session,
+    table_name: str,
+    schema: Optional[str],
+    column_limit: int = 30,
+) -> List[Dict[str, Any]]:
+    """
+    Fetch columns for a specific table from Neo4j.
+    Returns list of column dictionaries with name, dtype, description, is_primary_key, etc.
+    """
+    query = """
+    MATCH (t:Table)-[:HAS_COLUMN]->(c:Column)
+    WHERE (
+        (t.name IS NOT NULL AND toLower(t.name) = toLower($table_name))
+        OR (t.original_name IS NOT NULL AND toLower(t.original_name) = toLower($table_name))
+    )
+    AND ($schema IS NULL OR (t.schema IS NOT NULL AND toLower(t.schema) = toLower($schema)))
+    RETURN c.name AS name,
+           c.dtype AS dtype,
+           c.description AS description,
+           c.is_primary_key AS is_primary_key,
+           c.nullable AS nullable
+    ORDER BY 
+        CASE WHEN c.is_primary_key = true THEN 0 ELSE 1 END,
+        c.name
+    LIMIT $limit
+    """
+    result = await neo4j_session.run(
+        query,
+        table_name=table_name,
+        schema=schema,
+        limit=column_limit,
+    )
+    records = await result.data()
+    return records
+
+
+# 계리수식 관련 키워드 (prefer_formula 모드에서 자동 추가)
+FORMULA_KEYWORDS = [
+    "formula", "calculation", "expression", "actuarial", "수식", "계산식",
+    "premium", "보험료", "risk", "위험", "reserve", "적립금", "claim", "보험금"
+]
+
+
 async def execute(
     context: ToolContext,
     keywords: List[str],
+    *,
+    include_columns: bool = False,
+    column_limit: int = 20,
 ) -> str:
     """
     Neo4j 스키마 그래프에서 키워드와 유사한 테이블을 검색한다.
     결과는 prompt.xml 지시에 맞춰 XML 문자열로 반환한다.
+    
+    Args:
+        context: Tool execution context
+        keywords: List of search keywords for table matching
+        include_columns: If True, fetch and include column info for each table
+                        (used by pre-search to reduce get_table_schema calls)
+        column_limit: Maximum number of columns to return per table (default 20)
+    
+    Returns:
+        XML string containing matched tables with optional column information
     """
     search_table_keyword_limit = max(int(context.scaled(context.search_table_keyword_limit)), 1)
+    
+    # prefer_formula 모드: 수식 관련 키워드를 우선 추가
+    if context.prefer_formula:
+        # 기존 키워드에 수식 관련 키워드 추가 (중복 제거)
+        existing_lower = {k.lower() for k in keywords}
+        formula_additions = [k for k in FORMULA_KEYWORDS if k.lower() not in existing_lower]
+        # 수식 키워드를 앞에 배치하여 우선 검색
+        keywords = formula_additions[:3] + keywords  # 상위 3개 수식 키워드만 추가
+    
     keywords = keywords[:search_table_keyword_limit]
 
     table_top_k = max(int(context.scaled(context.table_top_k)), 1)
@@ -33,6 +100,22 @@ async def execute(
     ) if importance_map else 0
 
     result_parts: List[str] = ["<tool_result>"]
+    
+    # ObjectType 모드면 dw 스키마만 검색 (Materialized View = ObjectType 테이블)
+    effective_schema_filter = context.schema_filter
+    if context.object_type_only and not effective_schema_filter:
+        effective_schema_filter = ['dw']
+    
+    # ObjectType 모드 표시
+    if context.object_type_only:
+        result_parts.append("<mode>domain_layer</mode>")
+        result_parts.append("<note>Searching ObjectType (Materialized View) tables only</note>")
+    
+    # 계리수식 우선 모드 표시
+    if context.prefer_formula:
+        result_parts.append("<mode>formula_priority</mode>")
+        result_parts.append("<note>계리수식/공식 관련 테이블과 컬럼을 우선적으로 검색합니다. 수식(formula), 계산식(calculation), 보험료(premium), 위험(risk) 등의 컬럼에 주목하세요.</note>")
+    
     output_table_names: Set[str] = set()
 
     def _table_key(name: str, schema: Optional[str]) -> str:
@@ -42,7 +125,7 @@ async def execute(
         matches = await searcher.search_tables(
             embedding,
             k=table_fetch_limit,
-            schema_filter=context.schema_filter
+            schema_filter=effective_schema_filter
         )
         filtered_matches = [
             match
@@ -63,11 +146,51 @@ async def execute(
             if table_key in output_table_names:
                 continue
 
+            # Use config's datasource prefix if not set in Neo4j
+            effective_datasource = match.datasource or settings.mindsdb_datasource_prefix
+            
             result_parts.append("<table>")
+            if effective_datasource:
+                result_parts.append(f"<datasource>{effective_datasource}</datasource>")
             result_parts.append(f"<schema>{match.schema or ''}</schema>")
             result_parts.append(f"<name>{match.name}</name>")
+            # Full qualified name for SQL: datasource.schema.table
+            if effective_datasource and match.schema:
+                full_table_name = f"{effective_datasource}.{match.schema}.{match.name}"
+            elif match.schema:
+                full_table_name = f"{match.schema}.{match.name}"
+            else:
+                full_table_name = match.name
+            result_parts.append(f"<full_table_name>{full_table_name}</full_table_name>")
             if match.description:
                 result_parts.append(f"<description>{match.description}</description>")
+
+            # Include columns if requested (for pre-search optimization)
+            if include_columns:
+                columns = await _fetch_table_columns(
+                    context.neo4j_session,
+                    match.name,
+                    match.schema,
+                    column_limit=column_limit,
+                )
+                if columns:
+                    result_parts.append("<columns>")
+                    for col in columns:
+                        col_name = col.get("name", "")
+                        if not col_name:
+                            continue
+                        result_parts.append("<column>")
+                        result_parts.append(f"<name>{col_name}</name>")
+                        if col.get("dtype"):
+                            result_parts.append(f"<dtype>{col['dtype']}</dtype>")
+                        if col.get("description"):
+                            result_parts.append(f"<description>{col['description']}</description>")
+                        if col.get("is_primary_key"):
+                            is_pk = str(col["is_primary_key"]).lower()
+                            if is_pk not in ("none", "null", "false", "0", ""):
+                                result_parts.append(f"<is_primary_key>{is_pk}</is_primary_key>")
+                        result_parts.append("</column>")
+                    result_parts.append("</columns>")
 
             relationship_details = await get_table_relationship_details(
                 context.neo4j_session,

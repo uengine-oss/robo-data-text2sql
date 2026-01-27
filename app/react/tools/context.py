@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Optional, List
+from typing import Any, Dict, Optional, List
 
 import asyncpg
 from neo4j import AsyncSession
@@ -36,6 +36,17 @@ class ToolContext:
     
     # Schema filter for limiting search to specific schemas (e.g., ["dw"] for OLAP only)
     schema_filter: Optional[List[str]] = None
+    
+    # ObjectType only mode (for domain layer - only search Materialized View tables)
+    object_type_only: bool = False
+    
+    # 연결된 ObjectType 정보 (프롬프트 확장용)
+    # [{name: str, columns: [{name: str, type: str}], description?: str}]
+    linked_object_types: Optional[List[Dict[str, Any]]] = None
+    
+    # 계리수식/공식 우선 검색 모드
+    # True일 경우 수식 컬럼(formula, calculation, expression 등)과 계산식을 우선 탐색
+    prefer_formula: bool = False
 
     def scaled(self, value: int) -> int:
         """TOOL_POWER_LEVEL 을 적용한 정수 값을 반환한다."""
@@ -55,6 +66,9 @@ class ToolContext:
         search_column_values_search_keywords_limit: Optional[int] = None,
         max_sql_seconds: Optional[int] = None,
         schema_filter: Optional[List[str]] = None,
+        object_type_only: Optional[bool] = None,
+        linked_object_types: Optional[List[Dict[str, Any]]] = None,
+        prefer_formula: Optional[bool] = None,
     ) -> "ToolContext":
         """필요시 일부 파라미터를 오버라이드한 새로운 컨텍스트를 생성한다."""
         return ToolContext(
@@ -73,5 +87,8 @@ class ToolContext:
             search_column_values_search_keywords_limit=search_column_values_search_keywords_limit or self.search_column_values_search_keywords_limit,
             max_sql_seconds=max_sql_seconds or self.max_sql_seconds,
             schema_filter=schema_filter if schema_filter is not None else self.schema_filter,
+            object_type_only=object_type_only if object_type_only is not None else self.object_type_only,
+            linked_object_types=linked_object_types if linked_object_types is not None else self.linked_object_types,
+            prefer_formula=prefer_formula if prefer_formula is not None else self.prefer_formula,
         )
 

@@ -1,6 +1,7 @@
 import json
 from typing import Any, Dict, List, Optional, Tuple
 
+from app.config import settings
 from app.core.sql_guard import SQLGuard
 from app.react.tools.context import ToolContext
 from app.react.tools.neo4j_utils import get_column_fk_relationships
@@ -210,6 +211,7 @@ async def execute(
     ORDER BY c.name
     RETURN COALESCE(t.original_name, t.name) AS table_name,
            t.schema AS table_schema,
+           t.datasource AS table_datasource,
            t.description AS table_description,
            collect({
                name: c.name,
@@ -245,6 +247,7 @@ async def execute(
     for record in records:
         table_name = record["table_name"]
         table_schema = record.get("table_schema", "")
+        table_datasource = record.get("table_datasource", "")
         table_description = record.get("table_description", "")
         columns = record["columns"]
 
@@ -268,9 +271,22 @@ async def execute(
             else:
                 resolved_schema, db_columns = db_metadata_cache[metadata_key]
 
+        # Use config's datasource prefix if not set in Neo4j
+        effective_datasource = table_datasource or settings.mindsdb_datasource_prefix
+        
         result_parts.append("<table>")
+        if effective_datasource:
+            result_parts.append(f"<datasource>{effective_datasource}</datasource>")
         result_parts.append(f"<schema>{table_schema}</schema>")
         result_parts.append(f"<name>{table_name}</name>")
+        # Full qualified name for SQL: datasource.schema.table
+        if effective_datasource and table_schema:
+            full_table_name = f"{effective_datasource}.{table_schema}.{table_name}"
+        elif table_schema:
+            full_table_name = f"{table_schema}.{table_name}"
+        else:
+            full_table_name = table_name
+        result_parts.append(f"<full_table_name>{full_table_name}</full_table_name>")
         if table_description:
             result_parts.append(f"<description>{table_description}</description>")
 

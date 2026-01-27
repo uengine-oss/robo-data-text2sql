@@ -87,6 +87,13 @@ async def process_cache_postprocess_payload(payload: Dict[str, Any]) -> None:
     sql = payload.get("validated_sql") or payload.get("final_sql") or payload.get("sql") or ""
     status = payload.get("status") or "completed"
 
+    print(f"\n{'='*60}")
+    print(f"[cache_postprocess] ===== FUNCTION CALLED =====")
+    print(f"[cache_postprocess] react_run_id={react_run_id}")
+    print(f"[cache_postprocess] question={question[:80] if question else 'None'}...")
+    print(f"[cache_postprocess] has_sql={bool(sql)}, status={status}")
+    print(f"{'='*60}\n")
+    
     SmartLogger.log(
         "INFO",
         "cache_postprocess.start",
@@ -203,6 +210,9 @@ async def process_cache_postprocess_payload(payload: Dict[str, Any]) -> None:
         # IMPORTANT: For Neo4j cache graph (Table/Column nodes), use the configured caching DB TYPE label.
         query_db = settings.react_caching_db_type
 
+        print(f"[cache_postprocess] Saving query to Neo4j: question={question[:50]}..., db={query_db}")
+        print(f"[cache_postprocess] identified_tables={len(identified_tables)}, identified_columns={len(identified_columns)}, validated_mappings={len(validated_mappings)}")
+        
         query_id = await repo.save_query(
             question=question,
             sql=sql,
@@ -222,6 +232,8 @@ async def process_cache_postprocess_payload(payload: Dict[str, Any]) -> None:
             steps_summary=steps_summary,
             value_mappings=[cand.__dict__ for cand in validated_mappings],
         )
+        
+        print(f"[cache_postprocess] Query saved with id={query_id}")
 
         # 4) Save value mappings (only validated ones)
         for cand in validated_mappings:

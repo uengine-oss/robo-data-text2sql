@@ -149,8 +149,16 @@ async def ask_question(
         # 7. Build provenance
         prompt_snapshot_id = f"ps_{int(time.time())}_{hash(request.question) % 10000}"
         
+        # 테이블명 생성: datasource가 있으면 datasource.schema.table, 없으면 schema.table
+        table_names = []
+        for t in subschema.tables:
+            if t.datasource:
+                table_names.append(f"{t.datasource}.{t.schema}.{t.name}")
+            else:
+                table_names.append(f"{t.schema}.{t.name}")
+        
         provenance = ProvenanceInfo(
-            tables=[f"{t.schema}.{t.name}" for t in subschema.tables],
+            tables=table_names,
             columns=[f"{c.table_name}.{c.name}" for c in subschema.columns[:10]],
             neo4j_paths=[f"{fk['from_table']} -> {fk['to_table']}" for fk in subschema.fk_relationships],
             vector_matches=[

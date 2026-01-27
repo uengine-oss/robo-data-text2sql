@@ -45,6 +45,9 @@ class Settings(BaseSettings):
     target_db_schemas: str = "public"  # Comma-separated list of schemas to access
     target_db_ssl: str = "disable"  # SSL mode: disable, require, verify-ca, verify-full
     
+    # MindsDB settings (when using mysql type with MindsDB)
+    mindsdb_datasource_prefix: str = ""  # Default datasource prefix for tables (e.g., "robo_postgres")
+    
     # API
     api_host: str = "0.0.0.0"
     api_port: int = 8000
@@ -52,7 +55,7 @@ class Settings(BaseSettings):
     
     # Security & Limits
     sql_timeout_seconds: int = 30
-    sql_row_limit: int = 1000
+    sql_row_limit: int = 100  # MindsDB 연결 안정성을 위해 100으로 제한
     sql_max_rows: int = 100000
     max_join_depth: int = 10
     max_subquery_depth: int = 10
@@ -89,6 +92,10 @@ class Settings(BaseSettings):
     gemini_context_cache_ttl_seconds: int = 3600
     gemini_context_cache_refresh_buffer_seconds: int = 120
     gemini_context_cache_retry_backoff_seconds: int = 60
+
+    # Explain Cache (캐시된 쿼리 패턴은 explain 건너뛰기)
+    explain_cache_enabled: bool = True
+    explain_cache_cost_threshold: float = 500.0  # 이 비용 이하면 캐시 신뢰
 
     class Config:
         env_file = ".env"

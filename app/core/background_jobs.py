@@ -98,6 +98,10 @@ async def stop_cache_postprocess_workers() -> None:
 
 def enqueue_cache_postprocess(payload: Dict[str, Any]) -> bool:
     """Best-effort enqueue. Returns True if queued, False otherwise."""
+    print(f"\n[background_jobs] enqueue_cache_postprocess called!")
+    print(f"[background_jobs] question={payload.get('question', 'N/A')[:50]}...")
+    print(f"[background_jobs] queue_is_none={_queue is None}")
+    
     if _queue is None:
         SmartLogger.log(
             "WARNING",

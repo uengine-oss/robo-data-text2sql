@@ -26,9 +26,11 @@ from app.react.enrich_react_metadata import (
 from app.react.state import ReactMetadata, ReactSessionState, MetadataParseError
 from app.react.llm_factory import ReactLLMHandle, create_react_llm
 from app.react.tools import ToolContext, ToolExecutionError, execute_tool
+from app.react.tools import search_tables as search_tables_tool
 from app.react.utils import XmlUtil
 from app.react.prompts import get_prompt_text
 from app.react.utils.log_sanitize import sanitize_for_log
+from app.react.utils.keyword_extractor import extract_search_keywords
 from app.smart_logger import SmartLogger
 
 
@@ -445,6 +447,36 @@ class ReactAgent:
             "tool_elapsed_ms_sum": 0.0,
         }
 
+        # 계리수식 우선 검색 모드가 활성화되어 있으면 user_query에 힌트 추가 (첫 iteration에서만)
+        if tool_context.prefer_formula and state.iteration == 0 and not user_response:
+            formula_hint = """
+
+[계리수식 우선 검색 모드 활성화]
+이 모드에서는 보험/계리 관련 수식과 계산식을 우선적으로 탐색합니다.
+- 수식(formula), 계산식(calculation), 표현식(expression) 컬럼에 주목하세요.
+- 보험료(premium), 위험보험료(risk_prem), 적립금(reserve), 보험금(claim) 관련 계산을 우선 탐색합니다.
+- alpha, beta, gamma 등 계리 파라미터 컬럼을 우선적으로 확인하세요.
+- 예정비용 vs 실제비용 비교 (planned vs actual) 관련 컬럼도 중요합니다.
+"""
+            state.user_query = state.user_query + formula_hint
+
+        # 연결된 ObjectType 정보가 있으면 user_query에 추가 (첫 iteration에서만)
+        if tool_context.linked_object_types and state.iteration == 0 and not user_response:
+            linked_info_parts = ["\n\n[연결된 ObjectType 정보 - correlation 속성 탐지용]"]
+            for obj_type in tool_context.linked_object_types:
+                type_name = obj_type.get("name", "Unknown")
+                cols = obj_type.get("columns", [])
+                col_names = [c.get("name", "") for c in cols if c.get("name")]
+                desc = obj_type.get("description", "")
+                linked_info_parts.append(f"- {type_name}: 속성=[{', '.join(col_names)}]")
+                if desc:
+                    linked_info_parts.append(f"  설명: {desc}")
+            linked_info_parts.append(
+                "\n[중요] 검색 결과에서 위 ObjectType들과 연결될 수 있는 correlation 컬럼이 있다면 "
+                "반드시 SELECT에 포함하세요. 예: 정수장명, 측정소코드 등 FK가 될 수 있는 속성."
+            )
+            state.user_query = state.user_query + "\n".join(linked_info_parts)
+
         if user_response:
             parts = ["<tool_result>"]
             if state.pending_agent_question:
@@ -455,6 +487,72 @@ class ReactAgent:
             parts.append(f"<user_response>{_to_cdata(user_response)}</user_response>")
             parts.append("</tool_result>")
             state.current_tool_result = "".join(parts)
+
+        # Pre-Search Optimization: automatically call search_tables before LLM decides
+        # This skips the first LLM turn for deciding whether to search tables
+        presearch_performed = False
+        if (
+            not user_response
+            and state.iteration == 0
+            and state.current_tool_result in ("", "<tool_result/>", "<tool_result></tool_result>")
+        ):
+            try:
+                keywords = extract_search_keywords(state.user_query, max_keywords=5)
+                if keywords:
+                    SmartLogger.log(
+                        "INFO",
+                        "react.presearch.start",
+                        category="react.presearch.start",
+                        params=sanitize_for_log({
+                            "react_run_id": run_id,
+                            "keywords": keywords,
+                            "question": state.user_query,
+                        }),
+                    )
+                    presearch_started = time.perf_counter()
+                    
+                    # Notify phase callback
+                    if on_phase:
+                        await on_phase("presearch", 0, {"keywords": keywords}, state)
+                    
+                    # Call search_tables with columns included
+                    presearch_result = await search_tables_tool.execute(
+                        tool_context,
+                        keywords,
+                        include_columns=True,
+                        column_limit=20,
+                    )
+                    presearch_elapsed = (time.perf_counter() - presearch_started) * 1000.0
+                    
+                    # Set the result as current_tool_result for first LLM call
+                    state.current_tool_result = f"""<tool_result>
+<presearch_note>Tables and columns automatically searched based on your question. Use this information to generate SQL directly if possible. If more details are needed for specific tables, use get_table_schema.</presearch_note>
+{presearch_result[len("<tool_result>"):-len("</tool_result>")].strip()}
+</tool_result>"""
+                    presearch_performed = True
+                    
+                    SmartLogger.log(
+                        "INFO",
+                        "react.presearch.complete",
+                        category="react.presearch.complete",
+                        params=sanitize_for_log({
+                            "react_run_id": run_id,
+                            "elapsed_ms": presearch_elapsed,
+                            "result_length": len(presearch_result),
+                        }),
+                    )
+            except Exception as presearch_exc:
+                SmartLogger.log(
+                    "WARNING",
+                    "react.presearch.error",
+                    category="react.presearch.error",
+                    params=sanitize_for_log({
+                        "react_run_id": run_id,
+                        "exception": repr(presearch_exc),
+                        "traceback": traceback.format_exc(),
+                    }),
+                )
+                # Continue without pre-search on error
 
         steps: List[ReactStep] = []
         iteration_limit = max_iterations or (state.remaining_tool_calls + 10)

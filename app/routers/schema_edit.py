@@ -39,6 +39,7 @@ class RelationshipRequest(BaseModel):
         targetColumn: 참조 컬럼명 (타겟 테이블의 컬럼)
         type: 관계 유형 (many_to_one, one_to_one 등)
         description: 관계 설명 (선택)
+        matchStrategy: Correlation 전략 (EXACT_MATCH, CONTAINS, STARTS_WITH, ENDS_WITH)
     """
     from_table: str
     from_schema: str = "public"
@@ -48,6 +49,7 @@ class RelationshipRequest(BaseModel):
     targetColumn: str
     type: str = "many_to_one"  # many_to_one, one_to_one
     description: Optional[str] = None
+    matchStrategy: str = "EXACT_MATCH"  # EXACT_MATCH, CONTAINS, STARTS_WITH, ENDS_WITH
 
 
 class RelationshipResponse(BaseModel):
@@ -290,6 +292,7 @@ async def add_relationship(
     
     # Create the relationship with unified attribute names
     # source='user': 사용자가 수동으로 추가 (실선 표시)
+    # matchStrategy: Correlation 전략 (EXACT_MATCH, CONTAINS, STARTS_WITH, ENDS_WITH)
     create_query = """
     MATCH (t1:Table {name: $from_table, schema: $from_schema})
     MATCH (t2:Table {name: $to_table, schema: $to_schema})
@@ -298,6 +301,7 @@ async def add_relationship(
         targetColumn: $targetColumn,
         type: $type,
         description: $description,
+        matchStrategy: $matchStrategy,
         source: 'user'
     }]->(t2)
     RETURN r
@@ -312,7 +316,8 @@ async def add_relationship(
         sourceColumn=request.sourceColumn,
         targetColumn=request.targetColumn,
         type=request.type,
-        description=request.description
+        description=request.description,
+        matchStrategy=request.matchStrategy
     )
     
     await create_result.data()

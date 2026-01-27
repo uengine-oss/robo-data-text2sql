@@ -27,6 +27,9 @@ RUN uv pip install --system --no-cache -r pyproject.toml
 # Reinstall numpy 1.x for legacy CPU compatibility (numpy 2.x requires X86_V2)
 RUN pip uninstall -y numpy && pip install --no-cache-dir "numpy<2"
 
+# Install aiomysql for MindsDB MySQL support
+RUN pip install --no-cache-dir aiomysql pymysql
+
 # Copy application code
 COPY app ./app
 COPY main.py .

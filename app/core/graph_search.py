@@ -13,6 +13,7 @@ class TableMatch:
     db: str
     description: str
     score: float
+    datasource: str = None  # 데이터 소스 이름 (MindsDB에서 사용)
     columns: List[Dict[str, Any]] = None
 
 
@@ -69,6 +70,7 @@ class GraphSearcher:
                node.schema AS schema,
                node.db AS db,
                node.description AS description,
+               node.datasource AS datasource,
                score
         ORDER BY score DESC, node.schema ASC, name ASC
         """
@@ -82,7 +84,8 @@ class GraphSearcher:
                 schema=r["schema"],
                 db=r["db"],
                 description=r.get("description", ""),
-                score=r["score"]
+                score=r["score"],
+                datasource=r.get("datasource")
             )
             for r in records
         ]
@@ -197,8 +200,12 @@ class GraphSearcher:
         MATCH (t1:Table)-[:HAS_COLUMN]->(c1:Column)-[fk:FK_TO]->(c2:Column)<-[:HAS_COLUMN]-(t2:Table)
         WHERE t1.name IN $tables AND t2.name IN $tables
         RETURN t1.name AS from_table,
+               t1.schema AS from_schema,
+               t1.datasource AS from_datasource,
                c1.name AS from_column,
                t2.name AS to_table,
+               t2.schema AS to_schema,
+               t2.datasource AS to_datasource,
                c2.name AS to_column,
                fk.constraint AS constraint_name
         """
@@ -250,12 +257,28 @@ class GraphSearcher:
         )
     
     def _generate_join_hints(self, fk_details: List[Dict[str, Any]]) -> List[str]:
-        """Generate human-readable join hints"""
+        """Generate human-readable join hints with datasource prefix"""
         hints = []
         for fk in fk_details:
+            # 데이터 소스가 있으면 datasource.schema.table 형식 사용
+            from_ds = fk.get('from_datasource')
+            from_schema = fk.get('from_schema', '')
+            to_ds = fk.get('to_datasource')
+            to_schema = fk.get('to_schema', '')
+            
+            if from_ds:
+                from_table_ref = f"{from_ds}.{from_schema}.{fk['from_table']}"
+            else:
+                from_table_ref = f"{from_schema}.{fk['from_table']}" if from_schema else fk['from_table']
+            
+            if to_ds:
+                to_table_ref = f"{to_ds}.{to_schema}.{fk['to_table']}"
+            else:
+                to_table_ref = f"{to_schema}.{fk['to_table']}" if to_schema else fk['to_table']
+            
             hint = (
-                f"JOIN {fk['to_table']} ON {fk['from_table']}.{fk['from_column']} = "
-                f"{fk['to_table']}.{fk['to_column']}"
+                f"JOIN {to_table_ref} ON {from_table_ref}.{fk['from_column']} = "
+                f"{to_table_ref}.{fk['to_column']}"
             )
             hints.append(hint)
         return hints
@@ -268,7 +291,12 @@ def format_subschema_for_prompt(subschema: SubSchema) -> str:
     # Tables section
     lines.append("=== Available Tables ===")
     for table in subschema.tables:
-        lines.append(f"\nTable: {table.schema}.{table.name}")
+        # 데이터 소스가 있으면 datasource.schema.table 형식 사용
+        if table.datasource:
+            table_ref = f"{table.datasource}.{table.schema}.{table.name}"
+        else:
+            table_ref = f"{table.schema}.{table.name}"
+        lines.append(f"\nTable: {table_ref}")
         if table.description:
             lines.append(f"  Description: {table.description}")
         if table.columns:
@@ -285,9 +313,25 @@ def format_subschema_for_prompt(subschema: SubSchema) -> str:
     if subschema.fk_relationships:
         lines.append("\n=== Foreign Key Relationships ===")
         for fk in subschema.fk_relationships:
+            # 데이터 소스가 있으면 포함
+            from_ds = fk.get('from_datasource')
+            from_schema = fk.get('from_schema', '')
+            to_ds = fk.get('to_datasource')
+            to_schema = fk.get('to_schema', '')
+            
+            if from_ds:
+                from_ref = f"{from_ds}.{from_schema}.{fk['from_table']}"
+            else:
+                from_ref = f"{from_schema}.{fk['from_table']}" if from_schema else fk['from_table']
+            
+            if to_ds:
+                to_ref = f"{to_ds}.{to_schema}.{fk['to_table']}"
+            else:
+                to_ref = f"{to_schema}.{fk['to_table']}" if to_schema else fk['to_table']
+            
             lines.append(
-                f"  {fk['from_table']}.{fk['from_column']} -> "
-                f"{fk['to_table']}.{fk['to_column']}"
+                f"  {from_ref}.{fk['from_column']} -> "
+                f"{to_ref}.{fk['to_column']}"
             )
     
     # Join hints

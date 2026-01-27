@@ -5,7 +5,7 @@ import traceback
 from typing import Any
 
 from app.config import settings
-from app.deps import get_db_connection
+from app.deps import get_db_connection, MYSQL_AVAILABLE
 from app.sanity_checks.result import SanityCheckResult
 
 
@@ -14,26 +14,74 @@ async def check_target_db(*, timeout_seconds: float = 10.0) -> SanityCheckResult
     Target DB connection + basic metadata queries.
 
     Fail-fast conditions:
-    - target_db_type is not PostgreSQL-compatible (current code uses asyncpg).
+    - target_db_type is not supported (postgresql or mysql).
     - configured schemas are missing.
     """
     name = "target_db"
 
     db_type = (settings.target_db_type or "").strip().lower()
-    if db_type not in {"postgresql", "postgres"}:
+    supported_types = {"postgresql", "postgres", "mysql"}
+    
+    if db_type not in supported_types:
         return SanityCheckResult(
             name=name,
             ok=False,
-            detail="Unsupported target_db_type for current implementation (asyncpg/PostgreSQL only).",
+            detail=f"Unsupported target_db_type. Supported: {supported_types}",
             data={"target_db_type": settings.target_db_type},
             error="target_db_type_mismatch",
+        )
+    
+    if db_type == "mysql" and not MYSQL_AVAILABLE:
+        return SanityCheckResult(
+            name=name,
+            ok=False,
+            detail="MySQL support requires aiomysql. Run: pip install aiomysql",
+            data={"target_db_type": settings.target_db_type},
+            error="aiomysql_not_installed",
         )
 
     schemas = [s.strip() for s in (settings.target_db_schemas or "").split(",") if s.strip()]
     if not schemas:
         schemas = [settings.target_db_schema]
 
-    async def _run() -> dict[str, Any]:
+    async def _run_mysql() -> dict[str, Any]:
+        """MySQL/MindsDB specific sanity check"""
+        async for conn in get_db_connection():
+            async with conn.cursor() as cursor:
+                # Get version
+                await cursor.execute("SELECT VERSION()")
+                version_row = await cursor.fetchone()
+                version = version_row[0] if version_row else "unknown"
+                
+                # Get current database
+                await cursor.execute("SELECT DATABASE()")
+                db_row = await cursor.fetchone()
+                current_db = db_row[0] if db_row else settings.target_db_name
+                
+                # List databases (MindsDB specific)
+                await cursor.execute("SHOW DATABASES")
+                db_rows = await cursor.fetchall()
+                databases = [r[0] for r in db_rows]
+                
+                # List tables in current database
+                await cursor.execute("SHOW TABLES")
+                table_rows = await cursor.fetchall()
+                table_count = len(table_rows)
+                
+                return {
+                    "db_type": settings.target_db_type,
+                    "host": f"{settings.target_db_host}:{settings.target_db_port}",
+                    "database": settings.target_db_name,
+                    "schemas": schemas,
+                    "current_db": current_db,
+                    "available_databases": databases,
+                    "table_count": table_count,
+                    "version": str(version),
+                }
+        raise RuntimeError("DB connection generator yielded no connection")
+
+    async def _run_postgres() -> dict[str, Any]:
+        """PostgreSQL specific sanity check"""
         async for conn in get_db_connection():
             version = await conn.fetchval("SELECT version()")
             current_db = await conn.fetchval("SELECT current_database()")
@@ -71,11 +119,13 @@ async def check_target_db(*, timeout_seconds: float = 10.0) -> SanityCheckResult
                 "version": (version.split(",")[0] if isinstance(version, str) else str(version)),
             }
 
-        # should never reach here
         raise RuntimeError("DB connection generator yielded no connection")
 
     try:
-        data = await asyncio.wait_for(_run(), timeout=timeout_seconds)
+        if db_type == "mysql":
+            data = await asyncio.wait_for(_run_mysql(), timeout=timeout_seconds)
+        else:
+            data = await asyncio.wait_for(_run_postgres(), timeout=timeout_seconds)
         return SanityCheckResult(name=name, ok=True, detail="OK", data=data)
     except Exception as exc:
         return SanityCheckResult(
