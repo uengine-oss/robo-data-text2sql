@@ -16,6 +16,7 @@ class TableInfo(BaseModel):
     description: str
     column_count: int
     datasource: Optional[str] = None  # 데이터 소스 이름 (예: mysql_jjy)
+    materialized_view: Optional[str] = None  # ObjectType의 경우 Materialized View 이름
 
 
 class ColumnInfo(BaseModel):
@@ -152,6 +153,124 @@ async def search_columns(
             dtype=r.get("dtype") or "unknown",
             nullable=r.get("nullable") if r.get("nullable") is not None else True,
             description=r.get("description") or ""
+        )
+        for r in records
+    ]
+
+
+@router.get("/datasources", response_model=List[str])
+async def list_datasources(
+    neo4j_session=Depends(get_neo4j_session)
+):
+    """
+    Get distinct list of datasources from Neo4j.
+    Returns list of datasource names (excluding empty/null).
+    """
+    query = """
+    MATCH (t:Table)
+    WHERE t.datasource IS NOT NULL AND t.datasource <> ''
+    RETURN DISTINCT t.datasource AS datasource
+    ORDER BY datasource
+    """
+    
+    result = await neo4j_session.run(query)
+    records = await result.data()
+    
+    return [r["datasource"] for r in records]
+
+
+@router.get("/datasources/{datasource}/schemas", response_model=List[str])
+async def list_schemas_by_datasource(
+    datasource: str,
+    neo4j_session=Depends(get_neo4j_session)
+):
+    """
+    Get distinct list of schemas for a specific datasource.
+    """
+    query = """
+    MATCH (t:Table)
+    WHERE t.datasource = $datasource
+    RETURN DISTINCT t.schema AS schema
+    ORDER BY schema
+    """
+    
+    result = await neo4j_session.run(query, datasource=datasource)
+    records = await result.data()
+    
+    return [r["schema"] for r in records if r["schema"]]
+
+
+@router.get("/datasources/{datasource}/schemas/{schema}/tables", response_model=List[TableInfo])
+async def list_tables_by_datasource_and_schema(
+    datasource: str,
+    schema: str,
+    limit: int = Query(500, ge=1, le=1000),
+    neo4j_session=Depends(get_neo4j_session)
+):
+    """
+    Get tables for a specific datasource and schema.
+    """
+    query = """
+    MATCH (t:Table)-[:HAS_COLUMN]->(c:Column)
+    WHERE t.datasource = $datasource AND t.schema = $schema
+    WITH t, count(c) AS col_count
+    RETURN t.name AS name,
+           t.schema AS schema,
+           t.datasource AS datasource,
+           coalesce(t.description, '') AS description,
+           col_count AS column_count
+    ORDER BY name
+    LIMIT $limit
+    """
+    
+    result = await neo4j_session.run(query, datasource=datasource, schema=schema, limit=limit)
+    records = await result.data()
+    
+    return [
+        TableInfo(
+            name=r["name"],
+            schema=r["schema"],
+            datasource=r.get("datasource") or None,
+            description=r.get("description") or "",
+            column_count=r["column_count"]
+        )
+        for r in records
+    ]
+
+
+@router.get("/objecttypes", response_model=List[TableInfo])
+async def list_objecttypes(
+    limit: int = Query(500, ge=1, le=1000),
+    neo4j_session=Depends(get_neo4j_session)
+):
+    """
+    Get ObjectType tables (온톨로지로 변환된 테이블, label:ObjectType).
+    These are Materialized Views in dw schema, but represented as ObjectType in Neo4j.
+    Returns materializedView attribute as the actual table name for MindsDB access.
+    """
+    query = """
+    MATCH (t:ObjectType)-[:HAS_COLUMN]->(c:Column)
+    WITH t, count(c) AS col_count
+    RETURN t.name AS name,
+           coalesce(t.schema, 'dw') AS schema,
+           t.materializedView AS materialized_view,
+           coalesce(t.description, '') AS description,
+           col_count AS column_count
+    ORDER BY name
+    LIMIT $limit
+    """
+    
+    result = await neo4j_session.run(query, limit=limit)
+    records = await result.data()
+    
+    return [
+        TableInfo(
+            name=r["name"],
+            schema=r["schema"],
+            datasource=None,  # ObjectType은 데이터 소스 없음
+            materialized_view=r.get("materialized_view"),  # Materialized View 이름
+            description=r.get("description") or "",
+            column_count=r["column_count"]
         )
         for r in records
     ]

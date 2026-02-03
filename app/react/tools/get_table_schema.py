@@ -3,7 +3,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from app.config import settings
 from app.core.sql_guard import SQLGuard
-from app.react.tools.context import ToolContext
+from app.react.tools.context import ToolContext, execute_fetch
 from app.react.tools.neo4j_utils import get_column_fk_relationships
 
 
@@ -104,23 +104,46 @@ async def _fetch_table_columns(
 
     schema_param = str(schema_hint or "").strip()
 
-    if schema_param:
-        query = """
-        SELECT table_schema, column_name
-        FROM information_schema.columns
-        WHERE lower(table_name) = lower($1)
-          AND lower(table_schema) = lower($2)
-        ORDER BY ordinal_position
-        """
-        rows = await conn.fetch(query, table_param, schema_param)
+    is_mysql = settings.target_db_type.lower() == "mysql"
+    
+    if is_mysql:
+        # MySQL: %s 플레이스홀더, LOWER() 함수 사용
+        if schema_param:
+            query = """
+            SELECT table_schema, column_name
+            FROM information_schema.columns
+            WHERE lower(table_name) = lower(%s)
+              AND lower(table_schema) = lower(%s)
+            ORDER BY ordinal_position
+            """
+            rows = await execute_fetch(conn, query, table_param, schema_param)
+        else:
+            query = """
+            SELECT table_schema, column_name
+            FROM information_schema.columns
+            WHERE lower(table_name) = lower(%s)
+            ORDER BY ordinal_position
+            """
+            rows = await execute_fetch(conn, query, table_param)
     else:
-        query = """
-        SELECT table_schema, column_name
-        FROM information_schema.columns
-        WHERE lower(table_name) = lower($1)
-        ORDER BY ordinal_position
-        """
-        rows = await conn.fetch(query, table_param)
+        # PostgreSQL: $1, $2 플레이스홀더
+        if schema_param:
+            query = """
+            SELECT table_schema, column_name
+            FROM information_schema.columns
+            WHERE lower(table_name) = lower($1)
+              AND lower(table_schema) = lower($2)
+            ORDER BY ordinal_position
+            """
+            rows = await execute_fetch(conn, query, table_param, schema_param)
+        else:
+            query = """
+            SELECT table_schema, column_name
+            FROM information_schema.columns
+            WHERE lower(table_name) = lower($1)
+            ORDER BY ordinal_position
+            """
+            rows = await execute_fetch(conn, query, table_param)
 
     if not rows:
         return schema_hint, {}
@@ -161,7 +184,7 @@ async def _fetch_column_values(
         f"ORDER BY {column_identifier} "
         f"LIMIT {limit}"
     )
-    rows = await conn.fetch(query)
+    rows = await execute_fetch(conn, query)
     return [row["value"] for row in rows if "value" in row]
 
 

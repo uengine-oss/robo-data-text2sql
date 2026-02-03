@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 from app.deps import get_db_connection, get_openai_client
 from app.core.sql_exec import SQLExecutor, SQLExecutionError
 from app.core.sql_guard import SQLGuard, SQLValidationError
+from app.react.tools.utils import quote_uppercase_identifiers
 from app.smart_logger import SmartLogger
 
 
@@ -81,10 +82,11 @@ async def execute_direct_sql(
         params={"sql": request.sql[:200]},
     )
     
-    # 1. SQL 검증
+    # 1. SQL 검증 (MindsDB: 대문자 스키마/테이블명에 백틱 추가)
+    processed_sql = quote_uppercase_identifiers(request.sql)
     guard = SQLGuard()
     try:
-        validated_sql, _ = guard.validate(request.sql)
+        validated_sql, _ = guard.validate(processed_sql)
     except SQLValidationError as exc:
         SmartLogger.log(
             "WARNING",
@@ -238,12 +240,13 @@ async def execute_direct_sql_stream(
     async def event_generator():
         start_time = time.perf_counter()
         
-        # 1. SQL 검증
+        # 1. SQL 검증 (MindsDB: 대문자 스키마/테이블명에 백틱 추가)
         yield json.dumps({"event": "validating", "message": "SQL 검증 중..."}, ensure_ascii=False) + "\n"
         
+        processed_sql = quote_uppercase_identifiers(request.sql)
         guard = SQLGuard()
         try:
-            validated_sql, _ = guard.validate(request.sql)
+            validated_sql, _ = guard.validate(processed_sql)
             yield json.dumps({"event": "validated", "validated_sql": validated_sql}, ensure_ascii=False) + "\n"
         except SQLValidationError as exc:
             yield json.dumps({"event": "error", "message": f"SQL 검증 실패: {exc}"}, ensure_ascii=False) + "\n"
@@ -372,10 +375,11 @@ async def create_materialized_view(
         },
     )
     
-    # 1. 소스 SQL 검증 (SELECT 문인지 확인)
+    # 1. 소스 SQL 검증 (SELECT 문인지 확인, MindsDB: 대문자 백틱 추가)
+    processed_sql = quote_uppercase_identifiers(request.source_sql)
     guard = SQLGuard()
     try:
-        validated_sql, _ = guard.validate(request.source_sql)
+        validated_sql, _ = guard.validate(processed_sql)
     except SQLValidationError as exc:
         return MaterializedViewResponse(
             status="error",

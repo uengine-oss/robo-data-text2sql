@@ -117,6 +117,16 @@ async def ask_question(
                 }
             )
         
+        # 4.5. MindsDB용 datasource 프리픽스 추가 (schema.table → datasource.schema.table)
+        from app.react.tools.utils import add_datasource_prefix, quote_uppercase_identifiers
+        original_sql = validated_sql
+        validated_sql = add_datasource_prefix(validated_sql)
+        if original_sql != validated_sql:
+            print(f"[Text2SQL] Datasource prefix 추가: {original_sql[:100]}... → {validated_sql[:100]}...")
+        
+        # 4.6. MindsDB용 식별자 백틱 추가 (대문자/한글 식별자 처리)
+        validated_sql = quote_uppercase_identifiers(validated_sql)
+        
         # 5. Execute SQL
         sql_start = time.time()
         executor = SQLExecutor()

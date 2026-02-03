@@ -3,6 +3,7 @@ from typing import List
 from app.core.sql_exec import SQLExecutor, SQLExecutionError
 from app.core.sql_guard import SQLGuard, SQLValidationError
 from app.react.tools.context import ToolContext
+from app.react.tools.utils import quote_uppercase_identifiers
 
 
 async def execute(
@@ -21,6 +22,9 @@ async def execute(
     result_parts: List[str] = ["<tool_result>"]
 
     try:
+        # MindsDB: 대문자 스키마/테이블명에 백틱 추가
+        sql = quote_uppercase_identifiers(sql)
+        
         validated_sql, _ = guard.validate(sql)
         results = await executor.execute_query(
             context.db_conn, 

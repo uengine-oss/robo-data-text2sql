@@ -90,12 +90,24 @@ class SQLGuard:
         return sql_with_limit, True
     
     def _is_mindsdb_query(self, sql: str) -> bool:
-        """MindsDB federated 쿼리인지 감지 (3-part 식별자 패턴)"""
-        # 패턴: datasource.schema.table 또는 datasource.table
-        # 예: posgres.rwis."AAA", mysql_full.common_db.customers, posgres.`RWIS`.`AAA`
+        """MindsDB federated 쿼리인지 감지 (2-part 또는 3-part 식별자 패턴)"""
+        # 패턴: datasource.table 또는 datasource.schema.table
+        # 예: rwis.`AA_GET_MIN_STATUS`, posgres.rwis."AAA", mysql_full.common_db.customers
         # 백틱(`) 또는 큰따옴표(") 또는 일반 식별자 지원
-        pattern = r'\bFROM\s+\w+\.[\w`"]+\.[\w`"\']+' 
-        return bool(re.search(pattern, sql, re.IGNORECASE))
+        
+        # 백틱이 포함된 쿼리는 MindsDB 쿼리로 간주
+        if '`' in sql:
+            return True
+        
+        # 3-part 식별자: datasource.schema.table
+        pattern_3part = r'\bFROM\s+\w+\.[\w`"]+\.[\w`"\']+'
+        if re.search(pattern_3part, sql, re.IGNORECASE):
+            return True
+        
+        # 2-part 식별자에서 datasource prefix 감지 (알려진 데이터소스 이름)
+        # rwis, postgres, mysql_sample 등
+        pattern_2part = r'\bFROM\s+(rwis|postgres|mysql_sample|mysql_full)\.\w+'
+        return bool(re.search(pattern_2part, sql, re.IGNORECASE))
     
     def _ensure_limit_simple(self, sql: str) -> str:
         """원본 SQL을 유지하면서 LIMIT만 추가 (MindsDB용)"""

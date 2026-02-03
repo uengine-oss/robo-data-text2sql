@@ -1,8 +1,9 @@
 import re
 from typing import List, Optional, Set, Tuple
 
+from app.config import settings
 from app.core.sql_guard import SQLGuard
-from app.react.tools.context import ToolContext
+from app.react.tools.context import ToolContext, execute_fetch
 
 
 _HINT_IDENTIFIER_PATTERN = re.compile(r'"([^"]+)"')
@@ -59,22 +60,74 @@ def _extract_hint_column(exc: Exception, target_table: str) -> Optional[str]:
     return None
 
 
+def _get_quote_char() -> str:
+    """DB 타입에 따른 식별자 인용 문자 반환."""
+    return '`' if settings.target_db_type.lower() == "mysql" else '"'
+
+
 def _quote_identifier(identifier: str) -> str:
-    """schema.table 혹은 table 형식을 적절히 이스케이프한다."""
+    """컬럼명 등의 식별자를 적절히 이스케이프한다.
+    
+    MySQL: 대문자 포함 시에만 백틱으로 감싼다.
+    PostgreSQL: 항상 따옴표로 감싼다.
+    """
+    q = _get_quote_char()
+    is_mysql = settings.target_db_type.lower() == "mysql"
     parts = [part for part in identifier.split(".") if part]
     if not parts:
-        return '""'
-    return ".".join(f'"{part}"' for part in parts)
+        return f'{q}{q}'
+    
+    def quote_part(part: str) -> str:
+        if is_mysql:
+            # MySQL: 대문자 포함 시에만 백틱
+            if any(c.isupper() for c in part):
+                return f'{q}{part}{q}'
+            return part
+        else:
+            # PostgreSQL: 항상 따옴표
+            return f'{q}{part}{q}'
+    
+    return ".".join(quote_part(part) for part in parts)
 
 
 def _quote_table_identifier(table: str, schema: Optional[str]) -> str:
-    """스키마와 테이블을 결합하여 완전한 식별자를 만든다."""
+    """스키마와 테이블을 결합하여 완전한 식별자를 만든다.
+    
+    MindsDB의 경우 datasource.schema.table 형식으로 반환.
+    대문자 식별자는 백틱으로 감싼다.
+    """
+    q = _get_quote_char()
+    is_mysql = settings.target_db_type.lower() == "mysql"
+    
+    parts = []
+    
+    # MindsDB datasource prefix 추가
+    if is_mysql and settings.mindsdb_datasource_prefix:
+        parts.append(settings.mindsdb_datasource_prefix)
+    
+    # 스키마 추가
     schema_parts = [part for part in (schema or "").split(".") if part]
+    parts.extend(schema_parts)
+    
+    # 테이블 추가
     table_parts = [part for part in table.split(".") if part]
-    parts = schema_parts + table_parts
+    parts.extend(table_parts)
+    
     if not parts:
-        return '""'
-    return ".".join(f'"{part}"' for part in parts)
+        return f'{q}{q}'
+    
+    # 대문자 식별자만 백틱으로 감싸기 (MySQL), 전체 감싸기 (PostgreSQL)
+    def quote_part(part: str) -> str:
+        if is_mysql:
+            # MySQL: 대문자 포함 시에만 백틱
+            if any(c.isupper() for c in part):
+                return f'{q}{part}{q}'
+            return part
+        else:
+            # PostgreSQL: 항상 따옴표
+            return f'{q}{part}{q}'
+    
+    return ".".join(quote_part(part) for part in parts)
 
 
 def _row_sort_key(row) -> Tuple:
@@ -94,7 +147,7 @@ async def _fetch_rows_with_progressive_keyword(
     suffix_keyword = base_keyword
     while True:
         if suffix_keyword not in tried_keywords:
-            rows = await context.db_conn.fetch(query_sql, f"%{suffix_keyword}%")
+            rows = await execute_fetch(context.db_conn, query_sql, f"%{suffix_keyword}%")
             tried_keywords.add(suffix_keyword)
             if rows:
                 return suffix_keyword, rows
@@ -107,7 +160,7 @@ async def _fetch_rows_with_progressive_keyword(
         prefix_keyword = prefix_keyword[1:]
         if prefix_keyword in tried_keywords:
             continue
-        rows = await context.db_conn.fetch(query_sql, f"%{prefix_keyword}%")
+        rows = await execute_fetch(context.db_conn, query_sql, f"%{prefix_keyword}%")
         tried_keywords.add(prefix_keyword)
         if rows:
             return prefix_keyword, rows
@@ -146,10 +199,19 @@ async def execute(
 
     def build_value_query(column: str) -> str:
         qualified_column = _quote_identifier(column)
-        return (
-            f"SELECT * FROM {qualified_table} "
-            f"WHERE {qualified_column}::text ILIKE $1 LIMIT {value_limit}"
-        )
+        is_mysql = settings.target_db_type.lower() == "mysql"
+        if is_mysql:
+            # MySQL: %s 플레이스홀더, LIKE (대소문자 구분 없음 by default)
+            return (
+                f"SELECT * FROM {qualified_table} "
+                f"WHERE {qualified_column} LIKE %s LIMIT {value_limit}"
+            )
+        else:
+            # PostgreSQL: $1 플레이스홀더, ILIKE, ::text 캐스팅
+            return (
+                f"SELECT * FROM {qualified_table} "
+                f"WHERE {qualified_column}::text ILIKE $1 LIMIT {value_limit}"
+            )
 
     def open_rows_tag(
         *,
@@ -203,7 +265,7 @@ async def execute(
 
     try:
         default_sql = f"SELECT * FROM {qualified_table} LIMIT {value_limit}"
-        default_rows = await context.db_conn.fetch(default_sql)
+        default_rows = await execute_fetch(context.db_conn, default_sql)
         default_rows = sorted(default_rows, key=_row_sort_key)
 
         result_parts.append('<rows type="default">')

@@ -18,6 +18,7 @@ from app.core.sql_guard import SQLGuard, SQLValidationError
 from app.react.agent import AgentOutcome, ReactAgent, ReactStep
 from app.react.state import ReactSessionState
 from app.react.tools import ToolContext
+from app.react.tools.utils import quote_uppercase_identifiers
 from app.react.streaming_xml_sections import StreamingXmlSectionsExtractor
 from app.react.utils.log_sanitize import sanitize_for_log
 from app.smart_logger import SmartLogger
@@ -471,6 +472,9 @@ async def run_react(
                                 "이 SQL은 explain 도구로 사전 검증되지 않았습니다. "
                                 "실행 전에 수동으로 검토하시기 바랍니다."
                             )
+                    
+                    # MindsDB: 대문자 스키마/테이블명에 백틱 추가
+                    final_sql = quote_uppercase_identifiers(final_sql)
                     
                     guard = SQLGuard()
                     try:

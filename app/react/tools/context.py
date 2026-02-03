@@ -1,9 +1,44 @@
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, List, Optional, Union
 
 import asyncpg
 from neo4j import AsyncSession
 from openai import AsyncOpenAI
+
+from app.config import settings
+
+# MySQL support
+try:
+    import aiomysql
+    MYSQL_AVAILABLE = True
+except ImportError:
+    MYSQL_AVAILABLE = False
+
+
+async def execute_fetch(
+    conn: Union[asyncpg.Connection, "aiomysql.Connection"],
+    query: str,
+    *args
+) -> List[Dict[str, Any]]:
+    """
+    PostgreSQL(asyncpg)과 MySQL(aiomysql) 모두 지원하는 fetch 헬퍼.
+    
+    Returns:
+        List of dictionaries (column_name -> value)
+    """
+    if settings.target_db_type.lower() == "mysql":
+        # MySQL (aiomysql) - cursor 기반
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            await cursor.execute(query, args if args else None)
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows] if rows else []
+    else:
+        # PostgreSQL (asyncpg) - fetch 메서드 사용
+        if args:
+            rows = await conn.fetch(query, *args)
+        else:
+            rows = await conn.fetch(query)
+        return [dict(row) for row in rows]
 
 
 @dataclass(slots=True)
