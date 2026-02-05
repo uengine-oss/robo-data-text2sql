@@ -23,10 +23,16 @@ SQL_KEYWORDS: Set[str] = {
 def quote_uppercase_identifiers(sql: str) -> str:
     """
     MindsDB SQL에서 대문자 스키마/테이블명/컬럼명/별칭에 백틱을 추가합니다.
+    또한 데이터소스명에 하이픈 등 특수문자가 포함된 경우에도 백틱을 추가합니다.
+    
+    주의: MINDSDB_DATASOURCE_PREFIX 설정과 무관하게 모든 datasource.schema.table 패턴을 처리합니다.
     
     예시:
-        FROM posgres.RWIS.RDWMSPLY_TB
-        → FROM posgres.`RWIS`.`RDWMSPLY_TB`
+        FROM robo-postgres.`RWIS`.`AAA`
+        → FROM `robo-postgres`.`RWIS`.`AAA`
+        
+        FROM my-db.RWIS.RDWMSPLY_TB
+        → FROM `my-db`.`RWIS`.`RDWMSPLY_TB`
         
         SELECT SUJ_SEQ, SUJ_WNAME
         → SELECT `SUJ_SEQ`, `SUJ_WNAME`
@@ -37,30 +43,45 @@ def quote_uppercase_identifiers(sql: str) -> str:
     if settings.target_db_type != "mysql":
         return sql
     
-    datasource_prefix = settings.mindsdb_datasource_prefix
+    def _needs_backtick(identifier: str) -> bool:
+        """식별자에 백틱이 필요한지 확인 (하이픈, 특수문자, 대문자 포함)"""
+        if not identifier:
+            return False
+        for c in identifier:
+            # 소문자, 숫자, 언더스코어만 안전한 문자
+            if c not in 'abcdefghijklmnopqrstuvwxyz0123456789_':
+                return True
+        return False
     
-    # 1단계: datasource.SCHEMA.TABLE 패턴 처리
-    if datasource_prefix:
-        def replace_table_ref(match):
-            ds = match.group(1)
-            schema = match.group(2)
-            table = match.group(3)
-            
-            if '`' in schema or '`' in table:
-                return match.group(0)
-            
-            has_upper_schema = any(c.isupper() for c in schema)
-            has_upper_table = any(c.isupper() for c in table)
-            
-            if has_upper_schema:
-                schema = f"`{schema}`"
-            if has_upper_table:
-                table = f"`{table}`"
-            
-            return f"{ds}.{schema}.{table}"
+    # 0단계: datasource.schema.table 패턴 처리
+    # 하이픈/특수문자/대문자가 포함된 경우에만 백틱 추가
+    # 모두 소문자이고 특수문자가 없으면 백틱 불필요
+    def replace_three_part_table_ref(match):
+        """3-part 테이블 참조 처리: datasource.schema.table"""
+        ds = match.group(1)  # 데이터소스
+        schema = match.group(2)  # 스키마
+        table = match.group(3)  # 테이블
         
-        pattern = rf'\b({re.escape(datasource_prefix)})\.([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\b'
-        sql = re.sub(pattern, replace_table_ref, sql)
+        # 데이터소스: 하이픈/특수문자/대문자가 있으면 백틱 추가
+        if not ds.startswith('`') and _needs_backtick(ds):
+            ds = f"`{ds}`"
+        
+        # 스키마: 대문자/특수문자가 있으면 백틱 추가
+        if not schema.startswith('`') and _needs_backtick(schema):
+            schema = f"`{schema}`"
+        
+        # 테이블: 대문자/특수문자가 있으면 백틱 추가
+        if not table.startswith('`') and _needs_backtick(table):
+            table = f"`{table}`"
+        
+        return f"{ds}.{schema}.{table}"
+    
+    # 모든 datasource.schema.table 패턴 처리
+    # 백틱으로 감싸진 datasource 또는 일반 datasource 모두 매칭
+    # 패턴: (`ds` 또는 ds).schema.table (하이픈 포함 데이터소스도 매칭)
+    # \b 대신 (?![A-Za-z0-9_]) 사용 (백틱 뒤에서도 동작)
+    pattern = r'(`[^`]+`|[A-Za-z][A-Za-z0-9_]*(?:-[A-Za-z0-9_]+)*)\.(`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)\.(`[^`]+`|[A-Za-z_][A-Za-z0-9_]*)(?![A-Za-z0-9_])'
+    sql = re.sub(pattern, replace_three_part_table_ref, sql)
     
     # 2단계: AS 별칭 처리 (한글, 대문자, 특수문자 포함 별칭)
     # AS 뒤에 오는 식별자가 백틱 없이 한글이나 대문자를 포함하면 백틱 추가
@@ -139,16 +160,17 @@ def add_datasource_prefix(sql: str) -> str:
     
     LLM이 생성한 SQL이 schema.table 형식일 때, MindsDB가 요구하는 
     datasource.schema.table 형식으로 변환합니다.
+    데이터소스명에 하이픈 등 특수문자가 포함된 경우 백틱으로 감싸줍니다.
     
     예시:
         FROM RWIS.RPT_TB2
-        → FROM posgres.RWIS.RPT_TB2 (mindsdb_datasource_prefix가 "posgres"인 경우)
+        → FROM `robo-postgres`.RWIS.RPT_TB2 (mindsdb_datasource_prefix가 "robo-postgres"인 경우)
         
         SELECT * FROM "RWIS"."RPT_TB2"
-        → SELECT * FROM posgres."RWIS"."RPT_TB2"
+        → SELECT * FROM `robo-postgres`."RWIS"."RPT_TB2"
         
         FROM `RWIS`.`RPT_TB2`
-        → FROM posgres.`RWIS`.`RPT_TB2`
+        → FROM `robo-postgres`.`RWIS`.`RPT_TB2`
     """
     if settings.target_db_type != "mysql":
         return sql
@@ -157,8 +179,22 @@ def add_datasource_prefix(sql: str) -> str:
     if not datasource_prefix:
         return sql
     
-    # 이미 datasource 프리픽스가 있는 경우 스킵
-    if re.search(rf'\b{re.escape(datasource_prefix)}\.\w+\.\w+', sql, re.IGNORECASE):
+    # 데이터소스명에 하이픈/특수문자가 있으면 백틱으로 감싸기
+    def _needs_backtick(identifier: str) -> bool:
+        """식별자에 백틱이 필요한지 확인"""
+        if not identifier:
+            return False
+        for c in identifier:
+            if c not in 'abcdefghijklmnopqrstuvwxyz0123456789_':
+                return True
+        return False
+    
+    # 백틱이 필요한 경우 감싸서 사용
+    ds_with_backtick = f"`{datasource_prefix}`" if _needs_backtick(datasource_prefix) else datasource_prefix
+    
+    # 이미 datasource 프리픽스가 있는 경우 스킵 (백틱 있거나 없는 경우 모두 체크)
+    escaped_ds = re.escape(datasource_prefix)
+    if re.search(rf'(?:`{escaped_ds}`|{escaped_ds})\.\w+\.\w+', sql, re.IGNORECASE):
         return sql
     
     # FROM/JOIN 절에서 schema.table 패턴 찾기
@@ -173,8 +209,8 @@ def add_datasource_prefix(sql: str) -> str:
         if schema.lower() == datasource_prefix.lower():
             return match.group(0)
         
-        # datasource 프리픽스 추가
-        return f"{prefix} {datasource_prefix}.{quote_char}{schema}{quote_char}.{quote_char}{table}{quote_char}"
+        # datasource 프리픽스 추가 (백틱 적용)
+        return f"{prefix} {ds_with_backtick}.{quote_char}{schema}{quote_char}.{quote_char}{table}{quote_char}"
     
     def replace_table_ref_unquoted(match):
         """따옴표가 없는 경우: FROM schema.table"""
@@ -186,8 +222,8 @@ def add_datasource_prefix(sql: str) -> str:
         if schema.lower() == datasource_prefix.lower():
             return match.group(0)
         
-        # datasource 프리픽스 추가
-        return f"{prefix} {datasource_prefix}.{schema}.{table}"
+        # datasource 프리픽스 추가 (백틱 적용)
+        return f"{prefix} {ds_with_backtick}.{schema}.{table}"
     
     # 패턴 1: FROM "schema"."table" 또는 FROM `schema`.`table` (둘 다 같은 따옴표)
     pattern1 = r'(\b(?:FROM|JOIN)\s+)(["`])([A-Za-z_][A-Za-z0-9_]*)\2\.\2([A-Za-z_][A-Za-z0-9_]*)\2'
@@ -204,8 +240,8 @@ def add_datasource_prefix(sql: str) -> str:
         if schema.lower() == datasource_prefix.lower():
             return match.group(0)
         
-        # datasource 프리픽스 추가
-        return f"{prefix} {datasource_prefix}.{schema}.{table}"
+        # datasource 프리픽스 추가 (백틱 적용)
+        return f"{prefix} {ds_with_backtick}.{schema}.{table}"
     
     pattern2 = r'(\b(?:FROM|JOIN)\s+)([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)'
     sql = re.sub(pattern2, replace_unquoted_safe, sql, flags=re.IGNORECASE)
