@@ -101,8 +101,19 @@ class Neo4jQueryRepository:
             """
             ,
             """
-            CREATE VECTOR INDEX query_vec_index IF NOT EXISTS
-            FOR (q:Query) ON (q.vector)
+            CREATE VECTOR INDEX query_question_vec_index IF NOT EXISTS
+            FOR (q:Query) ON (q.vector_question)
+            OPTIONS {
+                indexConfig: {
+                    `vector.dimensions`: $dimensions,
+                    `vector.similarity_function`: 'cosine'
+                }
+            }
+            """
+            ,
+            """
+            CREATE VECTOR INDEX query_intent_vec_index IF NOT EXISTS
+            FOR (q:Query) ON (q.vector_intent)
             OPTIONS {
                 indexConfig: {
                     `vector.dimensions`: $dimensions,
@@ -272,6 +283,16 @@ class Neo4jQueryRepository:
         db: Optional[str] = None,
         steps_summary: Optional[str] = None,
         value_mappings: Optional[List[Dict[str, Any]]] = None,
+        best_context_score: Optional[float] = None,
+        best_context_steps_features: Optional[Dict[str, Any]] = None,
+        best_context_steps_summary: Optional[str] = None,
+        # Quality gate / verification flags (used by cache_postprocess)
+        # IMPORTANT: default to unverified for safety. Cache postprocess explicitly sets verified=True.
+        verified: bool = False,
+        verified_confidence: Optional[float] = None,
+        verified_confidence_avg: Optional[float] = None,
+        verified_source: Optional[str] = None,
+        quality_gate_json: Optional[str] = None,
     ) -> str:
         """쿼리와 관련 메타데이터를 Neo4j에 저장"""
         import json as json_module
@@ -290,12 +311,22 @@ class Neo4jQueryRepository:
             RETURN q.status AS status,
                    q.steps_count AS steps_count,
                    q.execution_time_ms AS execution_time_ms,
-                   q.best_run_at_ms AS best_run_at_ms
+                   q.best_run_at_ms AS best_run_at_ms,
+                   q.best_context_score AS best_context_score,
+                   q.best_context_run_at_ms AS best_context_run_at_ms,
+                   q.verified AS verified,
+                   q.quality_gate_json AS quality_gate_json,
+                   q.steps_summary AS steps_summary
             """,
             id=query_id,
         )
         existing_record = await existing_result.single()
         existing_rank: Optional[Tuple[int, int, float, int]] = None
+        existing_context_score: Optional[float] = None
+        existing_context_run_at_ms: Optional[int] = None
+        existing_verified: Optional[bool] = None
+        existing_quality_gate_json: str = ""
+        existing_steps_summary: str = ""
         if existing_record:
             existing_rank = self._candidate_rank(
                 status=existing_record.get("status"),
@@ -303,6 +334,28 @@ class Neo4jQueryRepository:
                 execution_time_ms=existing_record.get("execution_time_ms"),
                 best_run_at_ms=existing_record.get("best_run_at_ms"),
             )
+            try:
+                ecs = existing_record.get("best_context_score")
+                existing_context_score = float(ecs) if ecs is not None else None
+            except Exception:
+                existing_context_score = None
+            try:
+                ect = existing_record.get("best_context_run_at_ms")
+                existing_context_run_at_ms = int(ect) if ect is not None else None
+            except Exception:
+                existing_context_run_at_ms = None
+            try:
+                existing_verified = bool(existing_record.get("verified")) if existing_record.get("verified") is not None else None
+            except Exception:
+                existing_verified = None
+            try:
+                existing_quality_gate_json = str(existing_record.get("quality_gate_json") or "")
+            except Exception:
+                existing_quality_gate_json = ""
+            try:
+                existing_steps_summary = str(existing_record.get("steps_summary") or "")
+            except Exception:
+                existing_steps_summary = ""
         incoming_rank = self._candidate_rank(
             status=status,
             steps_count=steps_count,
@@ -310,6 +363,44 @@ class Neo4jQueryRepository:
             best_run_at_ms=now_ms,
         )
         should_overwrite = existing_rank is None or incoming_rank < existing_rank
+
+        # Verification upgrade policy:
+        # - If an existing entry is unverified (e.g. created by /history), allow cache_postprocess to overwrite it.
+        # - Also allow overwrite when we can fill missing gate/summary fields (non-empty incoming, empty existing).
+        try:
+            incoming_verified = bool(verified)
+        except Exception:
+            incoming_verified = False
+        if not should_overwrite:
+            if incoming_verified and not bool(existing_verified):
+                should_overwrite = True
+            else:
+                try:
+                    inc_qgj = str(quality_gate_json or "")
+                except Exception:
+                    inc_qgj = ""
+                try:
+                    inc_ss = str(steps_summary or "")
+                except Exception:
+                    inc_ss = ""
+                if (inc_qgj and not existing_quality_gate_json) or (inc_ss and not existing_steps_summary):
+                    should_overwrite = True
+
+        # Best-context overwrite policy: prefer richer context independent of best_sql overwrite.
+        try:
+            incoming_context_score = float(best_context_score) if best_context_score is not None else 0.0
+        except Exception:
+            incoming_context_score = 0.0
+        # Require at least a small improvement to avoid oscillations due to float noise.
+        eps = 1e-6
+        should_overwrite_context = (
+            existing_context_score is None
+            or float(incoming_context_score) > float(existing_context_score) + eps
+            or (
+                float(incoming_context_score) >= float(existing_context_score or 0.0)
+                and (existing_context_run_at_ms is None or int(now_ms) > int(existing_context_run_at_ms))
+            )
+        )
 
         if steps_summary is None:
             steps_summary = self._minimize_steps_summary(steps, json_module=json_module)
@@ -357,7 +448,21 @@ class Neo4jQueryRepository:
                 q.updated_at_ms = $now_ms,
                 q.best_run_at_ms = $now_ms,
                 q.value_mappings_count = $value_mappings_count,
-                q.value_mapping_terms = $value_mapping_terms
+                q.value_mapping_terms = $value_mapping_terms,
+                q.verified = $verified,
+                q.verified_confidence = $verified_confidence,
+                q.verified_confidence_avg = $verified_confidence_avg,
+                q.verified_source = $verified_source,
+                q.verified_at = datetime(),
+                q.verified_at_ms = $now_ms,
+                q.quality_gate_json = $quality_gate_json
+        )
+        WITH q
+        FOREACH (_ IN CASE WHEN $overwrite_context THEN [1] ELSE [] END |
+            SET q.best_context_score = $best_context_score,
+                q.best_context_steps_features = $best_context_steps_features,
+                q.best_context_steps_summary = $best_context_steps_summary,
+                q.best_context_run_at_ms = $now_ms
         )
         RETURN q.id AS id
         """
@@ -379,6 +484,19 @@ class Neo4jQueryRepository:
                 now_ms=now_ms,
                 value_mappings_count=len(value_mappings or []),
                 value_mapping_terms=[(m.get("natural_value") or "") for m in (value_mappings or []) if isinstance(m, dict)][:20],
+                overwrite_context=bool(should_overwrite_context),
+                best_context_score=float(incoming_context_score),
+                best_context_steps_features=(
+                    json_module.dumps(best_context_steps_features or {}, ensure_ascii=False, default=str)[:8000]
+                    if isinstance(best_context_steps_features, dict)
+                    else json_module.dumps({}, ensure_ascii=False)
+                ),
+                best_context_steps_summary=(best_context_steps_summary or "")[:8000],
+                verified=bool(verified),
+                verified_confidence=float(verified_confidence) if verified_confidence is not None else None,
+                verified_confidence_avg=float(verified_confidence_avg) if verified_confidence_avg is not None else None,
+                verified_source=str(verified_source or ""),
+                quality_gate_json=(quality_gate_json or "")[:8000],
             )
 
             # Only refresh graph relations when overwriting the best entry.
@@ -534,9 +652,13 @@ class Neo4jQueryRepository:
         natural_value: str,
         code_value: str,
         column_fqn: str,
+        verified: bool = True,
+        verified_confidence: Optional[float] = None,
+        verified_source: Optional[str] = "cache_postprocess",
     ) -> None:
         """값 매핑을 Neo4j에 저장 (Column.fqn 기반, 품질 우선)."""
         started = time.perf_counter()
+        now_ms = int(time.time() * 1000)
         cypher = """
             MATCH (c:Column)
             WHERE c.fqn IS NOT NULL AND toLower(c.fqn) = toLower($column_fqn)
@@ -544,7 +666,12 @@ class Neo4jQueryRepository:
             MERGE (v:ValueMapping {natural_value: $natural_value, column_fqn: c.fqn})
             SET v.code_value = $code_value,
                 v.usage_count = COALESCE(v.usage_count, 0) + 1,
-                v.updated_at = datetime()
+                v.updated_at = datetime(),
+                v.verified = $verified,
+                v.verified_confidence = $verified_confidence,
+                v.verified_source = $verified_source,
+                v.verified_at = datetime(),
+                v.verified_at_ms = $now_ms
             MERGE (v)-[:MAPS_TO]->(c)
         """
         SmartLogger.log(
@@ -566,6 +693,10 @@ class Neo4jQueryRepository:
                 natural_value=natural_value,
                 code_value=code_value,
                 column_fqn=column_fqn,
+                verified=bool(verified),
+                verified_confidence=float(verified_confidence) if verified_confidence is not None else None,
+                verified_source=str(verified_source or ""),
+                now_ms=now_ms,
             )
             summary = await result.consume()
             counters = summary.counters

@@ -754,11 +754,12 @@ async def clear_llm_cache():
 
 @router.delete("/llm/invalidate")
 async def invalidate_llm_cache(
-    question: str = Query(..., description="캐시에서 제거할 질문")
+    question: str = Query(..., description="캐시에서 제거할 질문"),
+    datasource: Optional[str] = Query(None, description="(선택) MindsDB datasource"),
 ):
     """특정 질문의 LLM 캐시 무효화"""
     from app.core.query_cache import get_query_cache
     cache = get_query_cache()
-    removed = cache.invalidate(question)
+    removed = cache.invalidate(question, datasource=datasource)
     return {"message": "Cache invalidated" if removed else "Not found in cache", "question": question}
 

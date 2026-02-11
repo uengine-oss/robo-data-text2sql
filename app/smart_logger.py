@@ -207,7 +207,7 @@ class SmartLogger:
             max_inline_chars (int): 메인 로그에 포함할 최대 글자 수. 이보다 길면 분리 저장.
         """
         # message 에 특정 substring 이 포함되면 로깅 자체를 하지 않음
-        if self._is_message_blacklisted(message):
+        if self._is_message_blacklisted(message + (category or "")):
             return
 
         if not self._should_log(level):

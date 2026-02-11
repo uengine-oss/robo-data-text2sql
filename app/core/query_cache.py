@@ -43,15 +43,21 @@ class QueryCache:
         self._total_hits = 0
         self._total_misses = 0
     
-    def _generate_key(self, question: str) -> str:
-        """질문에 대한 캐시 키 생성"""
-        # 질문을 정규화하고 해시 생성
-        normalized = question.strip().lower()
-        return hashlib.md5(normalized.encode('utf-8')).hexdigest()
+    def _generate_key(self, question: str, *, datasource: Optional[str] = None) -> str:
+        """
+        캐시 키 생성.
+
+        MindsDB-only (Phase 1)에서는 datasource가 필수 계약이므로,
+        datasource를 키에 포함해 서로 다른 데이터소스 간 캐시 충돌을 방지한다.
+        """
+        q = (question or "").strip().lower()
+        ds = (datasource or "").strip().lower()
+        normalized = f"ds={ds}||q={q}" if ds else f"q={q}"
+        return hashlib.md5(normalized.encode("utf-8")).hexdigest()
     
-    def get(self, question: str) -> Optional[CachedResult]:
+    def get(self, question: str, *, datasource: Optional[str] = None) -> Optional[CachedResult]:
         """캐시에서 결과 조회"""
-        key = self._generate_key(question)
+        key = self._generate_key(question, datasource=datasource)
         
         if key not in self._cache:
             self._total_misses += 1
@@ -75,13 +81,15 @@ class QueryCache:
     def put(
         self,
         question: str,
+        *,
+        datasource: Optional[str] = None,
         final_sql: str,
         validated_sql: Optional[str] = None,
         execution_result: Optional[Dict[str, Any]] = None,
         steps_summary: str = ""
     ) -> str:
         """결과를 캐시에 저장"""
-        key = self._generate_key(question)
+        key = self._generate_key(question, datasource=datasource)
         
         # 용량 초과 시 가장 오래된 항목 제거
         while len(self._cache) >= self._max_size:
@@ -97,9 +105,9 @@ class QueryCache:
         
         return key
     
-    def invalidate(self, question: str) -> bool:
+    def invalidate(self, question: str, *, datasource: Optional[str] = None) -> bool:
         """특정 질문의 캐시 무효화"""
-        key = self._generate_key(question)
+        key = self._generate_key(question, datasource=datasource)
         if key in self._cache:
             del self._cache[key]
             return True

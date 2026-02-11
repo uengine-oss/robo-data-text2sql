@@ -13,12 +13,19 @@ router = APIRouter(prefix="/feedback", tags=["Feedback"])
 
 class FeedbackRequest(BaseModel):
     """User feedback on generated SQL"""
-    prompt_snapshot_id: str = Field(..., description="Original prompt snapshot ID")
+    # ask.py flow emits prompt_snapshot_id, but ReAct streaming flow doesn't.
+    prompt_snapshot_id: Optional[str] = Field(None, description="Original prompt snapshot ID (optional)")
+    # Optional context (useful for audit/debug; not required).
+    question: Optional[str] = Field(None, description="Original user question (optional)")
+    react_run_id: Optional[str] = Field(None, description="ReAct run id (optional)")
+    conversation_state: Optional[str] = Field(None, description="Conversation state token (optional)")
+
     original_sql: str = Field(..., description="Original generated SQL")
     corrected_sql: Optional[str] = Field(None, description="User's corrected SQL")
     rating: int = Field(..., ge=1, le=5, description="User rating (1-5)")
     notes: Optional[str] = Field(None, description="Additional feedback notes")
     approved: bool = Field(default=False, description="Whether the result was approved")
+    source: Optional[str] = Field(default="ui", description="Feedback source tag (ui/api/etc)")
 
 
 class FeedbackResponse(BaseModel):
@@ -36,19 +43,29 @@ async def submit_feedback(
     Submit feedback on a generated SQL query.
     This can be used to improve future query generation.
     """
+    # Normalize / generate prompt_snapshot_id (best-effort)
+    snapshot_id = (feedback.prompt_snapshot_id or "").strip()
+    if not snapshot_id:
+        base = (feedback.question or "") + "|" + (feedback.original_sql or "")
+        snapshot_id = f"ps_{int(datetime.now().timestamp())}_{hash(base) % 10000}"
+
     # Generate feedback ID
-    feedback_id = f"fb_{int(datetime.now().timestamp())}_{hash(feedback.prompt_snapshot_id) % 10000}"
+    feedback_id = f"fb_{int(datetime.now().timestamp())}_{hash(snapshot_id) % 10000}"
     
     # Store feedback in Neo4j (or could use a separate feedback database)
     query = """
     CREATE (f:Feedback {
         id: $feedback_id,
         prompt_snapshot_id: $prompt_snapshot_id,
+        question: $question,
+        react_run_id: $react_run_id,
+        conversation_state: $conversation_state,
         original_sql: $original_sql,
         corrected_sql: $corrected_sql,
         rating: $rating,
         notes: $notes,
         approved: $approved,
+        source: $source,
         created_at: datetime()
     })
     RETURN f.id AS id
@@ -58,12 +75,16 @@ async def submit_feedback(
         result = await neo4j_session.run(
             query,
             feedback_id=feedback_id,
-            prompt_snapshot_id=feedback.prompt_snapshot_id,
+            prompt_snapshot_id=snapshot_id,
+            question=feedback.question,
+            react_run_id=feedback.react_run_id,
+            conversation_state=feedback.conversation_state,
             original_sql=feedback.original_sql,
             corrected_sql=feedback.corrected_sql,
             rating=feedback.rating,
             notes=feedback.notes,
-            approved=feedback.approved
+            approved=feedback.approved,
+            source=(feedback.source or "ui"),
         )
         
         record = await result.single()

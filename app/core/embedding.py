@@ -10,7 +10,12 @@ class EmbeddingClient:
     
     def __init__(self, client: AsyncOpenAI):
         self.client = client
-        self.model = settings.openai_embedding_model
+        provider = (getattr(settings, "embedding_provider", "") or "").strip().lower()
+        if provider not in {"openai"}:
+            raise NotImplementedError(
+                f"embedding_provider={provider!r} is not supported yet (only 'openai' is supported)."
+            )
+        self.model = settings.embedding_model
     
     async def embed_text(self, text: str) -> List[float]:
         """Generate embedding for a single text"""

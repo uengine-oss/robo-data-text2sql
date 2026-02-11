@@ -13,8 +13,8 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from app.deps import get_neo4j_session, get_openai_client
-from app.core.embedding import EmbeddingClient
+from app.deps import get_neo4j_session
+from app.core.llm_factory import create_embedding_client
 from app.core.graph_search import GraphSearcher, format_subschema_for_prompt
 from app.core.prompt import SQLChain
 from app.smart_logger import SmartLogger
@@ -55,6 +55,7 @@ class ChatResponse(BaseModel):
 class SQLGenerationRequest(BaseModel):
     """SQL 생성 요청"""
     question: str = Field(..., description="자연어 질문")
+    datasource: str = Field(..., description="MindsDB datasource (required; Phase 1 MindsDB-only)")
 
 
 class SQLGenerationResponse(BaseModel):
@@ -71,16 +72,17 @@ class SQLGenerationResponse(BaseModel):
 
 async def analyze_query_for_data_availability(
     question: str,
+    datasource: str,
     neo4j_session,
-    openai_client
 ) -> Dict[str, Any]:
     """자연어 쿼리에서 데이터 가용성 분석"""
     try:
-        embedding_client = EmbeddingClient(openai_client)
+        embedding_client = create_embedding_client()
         query_embedding = await embedding_client.embed_text(question)
         
         searcher = GraphSearcher(neo4j_session)
-        subschema = await searcher.build_subschema(query_embedding)
+        ds = (datasource or "").strip()
+        subschema = await searcher.build_subschema(query_embedding, datasource=(ds or None))
         
         if not subschema.tables:
             return {
@@ -107,7 +109,6 @@ async def analyze_query_for_data_availability(
 async def generate_monitoring_sql(
     question: str,
     subschema,
-    openai_client
 ) -> str:
     """감시용 SQL 쿼리 생성"""
     schema_text = format_subschema_for_prompt(subschema)
@@ -196,7 +197,6 @@ def extract_config_from_message(message: str) -> Dict[str, Any]:
 async def chat_with_builder(
     request: ChatRequest,
     neo4j_session=Depends(get_neo4j_session),
-    openai_client=Depends(get_openai_client)
 ):
     """
     에이전트 빌더와 대화
@@ -227,8 +227,8 @@ async def chat_with_builder(
         # 데이터 가용성 분석
         data_analysis = await analyze_query_for_data_availability(
             request.message,
+            request.current_config.get("datasource") if isinstance(request.current_config, dict) else "",
             neo4j_session,
-            openai_client
         )
         
         if not data_analysis["available"]:
@@ -250,7 +250,6 @@ async def chat_with_builder(
         generated_sql = await generate_monitoring_sql(
             request.message,
             data_analysis["subschema"],
-            openai_client
         )
         
         extracted_config['generated_sql'] = generated_sql
@@ -303,7 +302,6 @@ async def chat_with_builder(
 async def generate_sql(
     request: SQLGenerationRequest,
     neo4j_session=Depends(get_neo4j_session),
-    openai_client=Depends(get_openai_client)
 ):
     """
     자연어에서 감시용 SQL 쿼리 생성
@@ -314,8 +312,8 @@ async def generate_sql(
         # 데이터 가용성 분석
         data_analysis = await analyze_query_for_data_availability(
             request.question,
+            request.datasource,
             neo4j_session,
-            openai_client
         )
         
         if not data_analysis["available"]:
@@ -330,7 +328,6 @@ async def generate_sql(
         sql = await generate_monitoring_sql(
             request.question,
             data_analysis["subschema"],
-            openai_client
         )
         
         return SQLGenerationResponse(
@@ -353,7 +350,6 @@ async def generate_sql(
 async def analyze_availability(
     request: SQLGenerationRequest,
     neo4j_session=Depends(get_neo4j_session),
-    openai_client=Depends(get_openai_client)
 ):
     """
     자연어 쿼리의 데이터 가용성 분석
@@ -362,8 +358,8 @@ async def analyze_availability(
     """
     data_analysis = await analyze_query_for_data_availability(
         request.question,
+        request.datasource,
         neo4j_session,
-        openai_client
     )
     
     return {

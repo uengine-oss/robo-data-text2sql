@@ -60,6 +60,34 @@ async def init_schema():
             }}
         }}
         """
+        ,
+        # Query history constraints / indexes (for similar query search)
+        """
+        CREATE CONSTRAINT query_id IF NOT EXISTS
+        FOR (q:Query) REQUIRE q.id IS UNIQUE
+        """
+        ,
+        f"""
+        CREATE VECTOR INDEX query_question_vec_index IF NOT EXISTS
+        FOR (q:Query) ON (q.vector_question)
+        OPTIONS {{
+            indexConfig: {{
+                `vector.dimensions`: {EMBEDDING_DIMENSION},
+                `vector.similarity_function`: 'cosine'
+            }}
+        }}
+        """
+        ,
+        f"""
+        CREATE VECTOR INDEX query_intent_vec_index IF NOT EXISTS
+        FOR (q:Query) ON (q.vector_intent)
+        OPTIONS {{
+            indexConfig: {{
+                `vector.dimensions`: {EMBEDDING_DIMENSION},
+                `vector.similarity_function`: 'cosine'
+            }}
+        }}
+        """
     ]
     
     async with driver.session() as session:

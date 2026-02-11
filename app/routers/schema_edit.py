@@ -4,8 +4,8 @@ from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 import logging
 
-from app.deps import get_neo4j_session, get_openai_client
-from app.core.embedding import EmbeddingClient
+from app.deps import get_neo4j_session
+from app.core.llm_factory import create_embedding_client
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +39,6 @@ class RelationshipRequest(BaseModel):
         targetColumn: 참조 컬럼명 (타겟 테이블의 컬럼)
         type: 관계 유형 (many_to_one, one_to_one 등)
         description: 관계 설명 (선택)
-        matchStrategy: Correlation 전략 (EXACT_MATCH, CONTAINS, STARTS_WITH, ENDS_WITH)
     """
     from_table: str
     from_schema: str = "public"
@@ -49,7 +48,6 @@ class RelationshipRequest(BaseModel):
     targetColumn: str
     type: str = "many_to_one"  # many_to_one, one_to_one
     description: Optional[str] = None
-    matchStrategy: str = "EXACT_MATCH"  # EXACT_MATCH, CONTAINS, STARTS_WITH, ENDS_WITH
 
 
 class RelationshipResponse(BaseModel):
@@ -68,7 +66,6 @@ async def update_table_description(
     table_name: str,
     request: TableUpdateRequest,
     neo4j_session=Depends(get_neo4j_session),
-    openai_client=Depends(get_openai_client)
 ):
     """Update table description and regenerate embedding vector"""
     
@@ -94,9 +91,9 @@ async def update_table_description(
     
     # 2. 임베딩 생성 (설명 + 컬럼 목록 포함)
     embedding = None
-    if openai_client and request.description:
+    if request.description:
         try:
-            embedding_client = EmbeddingClient(openai_client)
+            embedding_client = create_embedding_client()
             embed_text = embedding_client.format_table_text(
                 table_name=table_name,
                 description=request.description or "",
@@ -151,7 +148,6 @@ async def update_column_description(
     column_name: str,
     request: ColumnUpdateRequest,
     neo4j_session=Depends(get_neo4j_session),
-    openai_client=Depends(get_openai_client)
 ):
     """Update column description and regenerate embedding vector"""
     
@@ -177,9 +173,9 @@ async def update_column_description(
     
     # 2. 임베딩 생성
     embedding = None
-    if openai_client and request.description:
+    if request.description:
         try:
-            embedding_client = EmbeddingClient(openai_client)
+            embedding_client = create_embedding_client()
             embed_text = embedding_client.format_column_text(
                 column_name=column_name,
                 table_name=table_name,
@@ -292,7 +288,6 @@ async def add_relationship(
     
     # Create the relationship with unified attribute names
     # source='user': 사용자가 수동으로 추가 (실선 표시)
-    # matchStrategy: Correlation 전략 (EXACT_MATCH, CONTAINS, STARTS_WITH, ENDS_WITH)
     create_query = """
     MATCH (t1:Table {name: $from_table, schema: $from_schema})
     MATCH (t2:Table {name: $to_table, schema: $to_schema})
@@ -301,7 +296,6 @@ async def add_relationship(
         targetColumn: $targetColumn,
         type: $type,
         description: $description,
-        matchStrategy: $matchStrategy,
         source: 'user'
     }]->(t2)
     RETURN r
@@ -316,8 +310,7 @@ async def add_relationship(
         sourceColumn=request.sourceColumn,
         targetColumn=request.targetColumn,
         type=request.type,
-        description=request.description,
-        matchStrategy=request.matchStrategy
+        description=request.description
     )
     
     await create_result.data()

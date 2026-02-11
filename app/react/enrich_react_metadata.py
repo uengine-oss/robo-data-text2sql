@@ -4,7 +4,7 @@ import re
 from app.react.state import ReactSessionState
 
 
-AUTO_ADDED_PURPOSE = "Referenced in reasoning (auto-added from search_tables)"
+AUTO_ADDED_PURPOSE = "Referenced in reasoning (auto-added from build_sql_context candidates)"
 
 
 def auto_enrich_tables_from_reasoning(
@@ -12,7 +12,7 @@ def auto_enrich_tables_from_reasoning(
     state: ReactSessionState,
 ) -> None:
     """
-    Reasoning 텍스트에 search_tables 후보 테이블명이 언급되면
+    Reasoning 텍스트에 build_sql_context 후보 테이블명이 언급되면
     해당 테이블을 자동으로 metadata.identified_tables 에 추가한다.
     """
     if not reasoning or not state.search_table_candidates:

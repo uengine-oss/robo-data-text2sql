@@ -290,7 +290,10 @@ async def create_history(
         execution_time_ms=entry.execution_time_ms,
         steps_count=entry.steps_count,
         error_message=entry.error_message,
-        steps=entry.steps
+        steps=entry.steps,
+        # History is not a verification source. Keep it unverified to prevent cache poisoning.
+        verified=False,
+        verified_source="history_api",
     )
     
     # 저장된 항목 조회하여 반환

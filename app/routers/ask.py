@@ -4,13 +4,16 @@ from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
 import time
 
-from app.deps import get_neo4j_session, get_db_connection, get_openai_client
+from app.config import settings
+from app.deps import get_neo4j_session, get_db_connection
+from app.core.llm_factory import create_embedding_client
 from app.core.embedding import EmbeddingClient
 from app.core.graph_search import GraphSearcher, format_subschema_for_prompt
 from app.core.prompt import SQLChain
 from app.core.sql_guard import SQLGuard, SQLValidationError
 from app.core.sql_exec import SQLExecutor, SQLExecutionError
 from app.core.viz import VizRecommender
+from app.core.sql_mindsdb_prepare import prepare_sql_for_mindsdb
 
 
 router = APIRouter(prefix="/ask", tags=["Query"])
@@ -19,10 +22,12 @@ router = APIRouter(prefix="/ask", tags=["Query"])
 class AskRequest(BaseModel):
     """Request model for /ask endpoint"""
     question: str = Field(..., description="Natural language question")
-    db_key: str = Field(default="default", description="Database identifier")
+    datasource: str = Field(..., description="MindsDB datasource (required; Phase 1 MindsDB-only)")
+    # Backward-compatible legacy field (deprecated; datasource is the canonical selector).
+    db_key: str = Field(default="default", description="(deprecated) Database identifier")
     visual_pref: Optional[List[str]] = Field(default=None, description="Preferred chart types")
     limit: Optional[int] = Field(default=1000, description="Row limit")
-    include_explain: bool = Field(default=False, description="Include query execution plan")
+    include_explain: bool = Field(default=False, description="(ignored in MindsDB-only) Include query execution plan")
 
 
 class ProvenanceInfo(BaseModel):
@@ -58,7 +63,6 @@ async def ask_question(
     request: AskRequest,
     neo4j_session=Depends(get_neo4j_session),
     db_conn=Depends(get_db_connection),
-    openai_client=Depends(get_openai_client)
 ):
     """
     Convert natural language question to SQL, execute it, and return results with visualizations.
@@ -72,14 +76,17 @@ async def ask_question(
     try:
         # 1. Generate query embedding
         embed_start = time.time()
-        embedding_client = EmbeddingClient(openai_client)
+        embedding_client = create_embedding_client()
         query_embedding = await embedding_client.embed_text(request.question)
         embedding_ms = (time.time() - embed_start) * 1000
         
         # 2. Search Neo4j graph for relevant schema
         graph_start = time.time()
         searcher = GraphSearcher(neo4j_session)
-        subschema = await searcher.build_subschema(query_embedding)
+        subschema = await searcher.build_subschema(
+            query_embedding,
+            datasource=request.datasource,
+        )
         graph_search_ms = (time.time() - graph_start) * 1000
         
         if not subschema.tables:
@@ -117,21 +124,15 @@ async def ask_question(
                 }
             )
         
-        # 4.5. MindsDB용 datasource 프리픽스 추가 (schema.table → datasource.schema.table)
-        from app.react.tools.utils import add_datasource_prefix, quote_uppercase_identifiers
-        original_sql = validated_sql
-        validated_sql = add_datasource_prefix(validated_sql)
-        if original_sql != validated_sql:
-            print(f"[Text2SQL] Datasource prefix 추가: {original_sql[:100]}... → {validated_sql[:100]}...")
-        
-        # 4.6. MindsDB용 식별자 백틱 추가 (대문자/한글 식별자 처리)
-        validated_sql = quote_uppercase_identifiers(validated_sql)
-        
-        # 5. Execute SQL
+        # 5. Execute SQL (MindsDB-only: apply datasource prefix + backticks)
         sql_start = time.time()
         executor = SQLExecutor()
         
         try:
+            db_type = str(getattr(settings, "target_db_type", "") or "").strip().lower()
+            if db_type in {"mysql", "mariadb"}:
+                validated_sql = prepare_sql_for_mindsdb(validated_sql, request.datasource).sql
+
             results = await executor.execute_query(db_conn, validated_sql)  # type: ignore[arg-type]
         except SQLExecutionError as e:
             # Return the attempted SQL even on failure
@@ -144,6 +145,11 @@ async def ask_question(
             )
         
         sql_ms = (time.time() - sql_start) * 1000
+
+        # Explicit truncation signal (D11)
+        if bool(results.get("truncated")):
+            max_cap = results.get("max_rows_cap", settings.sql_max_rows)
+            warnings.append(f"결과가 너무 커서 최대 {max_cap}행까지만 반환했습니다(부분 결과).")
         
         # 6. Generate visualizations
         viz_recommender = VizRecommender()
@@ -159,16 +165,8 @@ async def ask_question(
         # 7. Build provenance
         prompt_snapshot_id = f"ps_{int(time.time())}_{hash(request.question) % 10000}"
         
-        # 테이블명 생성: datasource가 있으면 datasource.schema.table, 없으면 schema.table
-        table_names = []
-        for t in subschema.tables:
-            if t.datasource:
-                table_names.append(f"{t.datasource}.{t.schema}.{t.name}")
-            else:
-                table_names.append(f"{t.schema}.{t.name}")
-        
         provenance = ProvenanceInfo(
-            tables=table_names,
+            tables=[f"{t.schema}.{t.name}" for t in subschema.tables],
             columns=[f"{c.table_name}.{c.name}" for c in subschema.columns[:10]],
             neo4j_paths=[f"{fk['from_table']} -> {fk['to_table']}" for fk in subschema.fk_relationships],
             vector_matches=[

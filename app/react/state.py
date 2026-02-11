@@ -208,8 +208,16 @@ class ReactSessionState:
     search_table_candidates: List[Dict[str, str]] = field(default_factory=list)
     max_sql_seconds: int = 60
     prefer_language: str = "ko"
-    explained_sqls: List[str] = field(default_factory=list)
     pending_agent_question: str = ""
+    # validate_sql 기반 게이트/재사용을 위한 상태
+    last_validated_sql: str = ""
+    last_validation_preview: Dict[str, Any] = field(default_factory=dict)
+    validation_fail_count: int = 0
+    # Auto context-refresh loop control (stop-condition-based). Best-effort; safe to ignore by callers.
+    auto_context_refresh_count: int = 0
+    auto_context_refresh_tried_queries: List[str] = field(default_factory=list)
+    auto_context_refresh_no_progress_streak: int = 0
+    auto_context_refresh_last_context_hash: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -226,8 +234,14 @@ class ReactSessionState:
             "search_table_candidates": self.search_table_candidates,
             "max_sql_seconds": self.max_sql_seconds,
             "prefer_language": self.prefer_language,
-            "explained_sqls": self.explained_sqls,
             "pending_agent_question": self.pending_agent_question,
+            "last_validated_sql": self.last_validated_sql,
+            "last_validation_preview": self.last_validation_preview,
+            "validation_fail_count": self.validation_fail_count,
+            "auto_context_refresh_count": self.auto_context_refresh_count,
+            "auto_context_refresh_tried_queries": list(self.auto_context_refresh_tried_queries or []),
+            "auto_context_refresh_no_progress_streak": self.auto_context_refresh_no_progress_streak,
+            "auto_context_refresh_last_context_hash": self.auto_context_refresh_last_context_hash,
         }
 
     def add_previous_reasoning(self, step: int, reasoning: str, limit: int) -> None:
@@ -257,8 +271,31 @@ class ReactSessionState:
         search_table_candidates = cls._normalize_search_table_candidates(
             data.get("search_table_candidates", [])
         )
-        explained_sqls = cls._normalize_explained_sqls(data.get("explained_sqls", []))
         pending_agent_question = (data.get("pending_agent_question") or "").strip()
+        last_validated_sql = (data.get("last_validated_sql") or "").strip()
+        last_validation_preview = data.get("last_validation_preview") or {}
+        if not isinstance(last_validation_preview, dict):
+            last_validation_preview = {}
+        try:
+            validation_fail_count = int(data.get("validation_fail_count", 0) or 0)
+        except (TypeError, ValueError):
+            validation_fail_count = 0
+        try:
+            auto_count = int(data.get("auto_context_refresh_count", 0) or 0)
+        except (TypeError, ValueError):
+            auto_count = 0
+        tried_raw = data.get("auto_context_refresh_tried_queries") or []
+        tried_list: List[str] = []
+        if isinstance(tried_raw, list):
+            for x in tried_raw[:50]:
+                s = str(x or "").strip()
+                if s:
+                    tried_list.append(s[:500])
+        try:
+            no_prog = int(data.get("auto_context_refresh_no_progress_streak", 0) or 0)
+        except (TypeError, ValueError):
+            no_prog = 0
+        last_hash = str(data.get("auto_context_refresh_last_context_hash") or "").strip()
         return cls(
             user_query=data["user_query"],
             dbms=data["dbms"],
@@ -273,8 +310,14 @@ class ReactSessionState:
             search_table_candidates=search_table_candidates,
             max_sql_seconds=data.get("max_sql_seconds", 60),
             prefer_language=data.get("prefer_language", "ko"),
-            explained_sqls=explained_sqls,
             pending_agent_question=pending_agent_question,
+            last_validated_sql=last_validated_sql,
+            last_validation_preview=last_validation_preview,
+            validation_fail_count=validation_fail_count,
+            auto_context_refresh_count=auto_count,
+            auto_context_refresh_tried_queries=tried_list,
+            auto_context_refresh_no_progress_streak=no_prog,
+            auto_context_refresh_last_context_hash=last_hash[:120],
         )
 
     @staticmethod
@@ -291,8 +334,31 @@ class ReactSessionState:
         search_table_candidates = cls._normalize_search_table_candidates(
             data.get("search_table_candidates", [])
         )
-        explained_sqls = cls._normalize_explained_sqls(data.get("explained_sqls", []))
         pending_agent_question = (data.get("pending_agent_question") or "").strip()
+        last_validated_sql = (data.get("last_validated_sql") or "").strip()
+        last_validation_preview = data.get("last_validation_preview") or {}
+        if not isinstance(last_validation_preview, dict):
+            last_validation_preview = {}
+        try:
+            validation_fail_count = int(data.get("validation_fail_count", 0) or 0)
+        except (TypeError, ValueError):
+            validation_fail_count = 0
+        try:
+            auto_count = int(data.get("auto_context_refresh_count", 0) or 0)
+        except (TypeError, ValueError):
+            auto_count = 0
+        tried_raw = data.get("auto_context_refresh_tried_queries") or []
+        tried_list: List[str] = []
+        if isinstance(tried_raw, list):
+            for x in tried_raw[:50]:
+                s = str(x or "").strip()
+                if s:
+                    tried_list.append(s[:500])
+        try:
+            no_prog = int(data.get("auto_context_refresh_no_progress_streak", 0) or 0)
+        except (TypeError, ValueError):
+            no_prog = 0
+        last_hash = str(data.get("auto_context_refresh_last_context_hash") or "").strip()
         return cls(
             user_query=data["user_query"],
             dbms=data["dbms"],
@@ -307,8 +373,14 @@ class ReactSessionState:
             search_table_candidates=search_table_candidates,
             max_sql_seconds=data.get("max_sql_seconds", 60),
             prefer_language=data.get("prefer_language", "ko"),
-            explained_sqls=explained_sqls,
             pending_agent_question=pending_agent_question,
+            last_validated_sql=last_validated_sql,
+            last_validation_preview=last_validation_preview,
+            validation_fail_count=validation_fail_count,
+            auto_context_refresh_count=auto_count,
+            auto_context_refresh_tried_queries=tried_list,
+            auto_context_refresh_no_progress_streak=no_prog,
+            auto_context_refresh_last_context_hash=last_hash[:120],
         )
 
     @classmethod
@@ -332,7 +404,13 @@ class ReactSessionState:
             search_table_candidates=[],
             max_sql_seconds=max_sql_seconds,
             prefer_language=prefer_language,
-            explained_sqls=[],
+            last_validated_sql="",
+            last_validation_preview={},
+            validation_fail_count=0,
+            auto_context_refresh_count=0,
+            auto_context_refresh_tried_queries=[],
+            auto_context_refresh_no_progress_streak=0,
+            auto_context_refresh_last_context_hash="",
         )
 
     @staticmethod
@@ -391,40 +469,13 @@ class ReactSessionState:
 
         return normalized
 
-    @staticmethod
-    def _normalize_explained_sqls(entries: Any) -> List[str]:
-        """Normalize explained SQLs list."""
-        if not isinstance(entries, list):
-            return []
-        return [str(sql).strip() for sql in entries if sql]
+    def record_validation_pass(self, *, sql: str, preview: Optional[Dict[str, Any]] = None) -> None:
+        self.last_validated_sql = (sql or "").strip()
+        self.last_validation_preview = preview or {}
+        self.validation_fail_count = 0
 
-    def add_explained_sql(self, sql: str) -> None:
-        """Add a SQL that has been explained."""
-        normalized = self._normalize_sql_for_comparison(sql)
-        if normalized and normalized not in [
-            self._normalize_sql_for_comparison(s) for s in self.explained_sqls
-        ]:
-            self.explained_sqls.append(sql.strip())
-
-    def has_any_explained_sql(self) -> bool:
-        """Return True if this session has successfully run explain at least once."""
-        return bool(self.explained_sqls)
-
-    def is_sql_explained(self, sql: str) -> bool:
-        """Check if a SQL has been explained."""
-        normalized = self._normalize_sql_for_comparison(sql)
-        if not normalized:
-            return False
-        for explained_sql in self.explained_sqls:
-            if self._normalize_sql_for_comparison(explained_sql) == normalized:
-                return True
-        return False
-
-    @staticmethod
-    def _normalize_sql_for_comparison(sql: str) -> str:
-        """Normalize SQL for comparison (remove extra whitespace)."""
-        if not sql:
-            return ""
-        import re
-        # Collapse all whitespace to single spaces and strip
-        return re.sub(r'\s+', ' ', sql.strip()).lower()
+    def record_validation_fail(self) -> None:
+        try:
+            self.validation_fail_count = int(self.validation_fail_count or 0) + 1
+        except Exception:
+            self.validation_fail_count = 1

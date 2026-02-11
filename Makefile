@@ -69,7 +69,7 @@ test-setup:
 	@if [ ! -f .env ]; then \
 		cp env.test.example .env; \
 		echo "✓ Created .env from env.test.example"; \
-		echo "⚠️  Please edit .env and add your OPENAI_API_KEY"; \
+		echo "⚠️  Please edit .env and add your OPENAI_API_KEY (and OPENAI_COMPATIBLE_API_KEY if using llm_provider=openai_compatible)"; \
 	else \
 		echo "⚠️  .env already exists, skipping..."; \
 	fi

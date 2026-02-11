@@ -10,6 +10,7 @@ _SENSITIVE_KEY_FRAGMENTS = {
     "api_key",
     "apikey",
     "openai_api_key",
+    "openai_compatible_api_key",
     "authorization",
     "access_token",
     "refresh_token",

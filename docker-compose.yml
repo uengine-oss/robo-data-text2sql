@@ -48,10 +48,31 @@ services:
       timeout: 5s
       retries: 5
 
+  mindsdb:
+    image: mindsdb/mindsdb:latest
+    container_name: mindsdb_text2sql
+    ports:
+      - "47334:47334"  # HTTP API (Web UI)
+      - "47335:47335"  # MySQL protocol endpoint
+    volumes:
+      - mindsdb_data:/root/mindsdb_storage
+    environment:
+      - MINDSDB_STORAGE_DIR=/root/mindsdb_storage
+    extra_hosts:
+      - "host.docker.internal:host-gateway"  # 호스트 머신 접근용
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:47334/api/status || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
 volumes:
   neo4j_data:
   neo4j_logs:
   neo4j_import:
   neo4j_plugins:
   postgres_data:
+  mindsdb_data:
 

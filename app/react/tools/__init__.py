@@ -4,12 +4,8 @@ import traceback
 
 from .context import ToolContext
 from . import (
-    search_tables as search_tables_tool,
-    get_table_schema as get_table_schema_tool,
-    search_column_values as search_column_values_tool,
-    execute_sql_preview as execute_sql_preview_tool,
-    explain as explain_tool,
-    find_similar_query as find_similar_query_tool,
+    build_sql_context as build_sql_context_tool,
+    validate_sql as validate_sql_tool,
 )
 from app.smart_logger import SmartLogger
 from app.react.utils.log_sanitize import sanitize_for_log
@@ -20,12 +16,8 @@ class ToolExecutionError(Exception):
 
 
 TOOL_HANDLERS = {
-    "search_tables": search_tables_tool.execute,
-    "get_table_schema": get_table_schema_tool.execute,
-    "search_column_values": search_column_values_tool.execute,
-    "execute_sql_preview": execute_sql_preview_tool.execute,
-    "explain": explain_tool.execute,
-    "find_similar_query": find_similar_query_tool.execute,
+    "build_sql_context": build_sql_context_tool.execute,
+    "validate_sql": validate_sql_tool.execute,
 }
 
 
@@ -60,42 +52,17 @@ async def execute_tool(
     )
 
     try:
-        if tool_name == "search_tables":
-            keywords: List[str] = parameters.get("keywords", [])
-            result = await handler(context, keywords)
-        elif tool_name == "get_table_schema":
-            table_names: List[str] = parameters.get("table_names", [])
-            result = await handler(context, table_names)
-        elif tool_name == "search_column_values":
-            table_name = parameters.get("table")
-            column_name = parameters.get("column")
-            schema_name = parameters.get("schema")
-            search_keywords: List[str] = parameters.get("search_keywords", [])
-            if not table_name or not column_name:
-                raise ToolExecutionError("table and column parameters are required")
-            result = await handler(
-                context,
-                table_name,
-                column_name,
-                search_keywords,
-                schema_name,
-            )
-        elif tool_name == "execute_sql_preview":
-            sql_text = parameters.get("sql")
-            if not sql_text:
-                raise ToolExecutionError("sql parameter is required")
-            result = await handler(context, sql_text)
-        elif tool_name == "explain":
-            sql_text = parameters.get("sql")
-            if not sql_text:
-                raise ToolExecutionError("sql parameter is required")
-            result = await handler(context, sql_text)
-        elif tool_name == "find_similar_query":
-            question = parameters.get("question")
-            min_similarity = parameters.get("min_similarity", 0.3)
+        if tool_name == "build_sql_context":
+            question = parameters.get("question") or parameters.get("sql") or parameters.get("text")
             if not question:
                 raise ToolExecutionError("question parameter is required")
-            result = await handler(context, question, min_similarity)
+            exclude_light_sqls = parameters.get("exclude_light_sqls")
+            result = await handler(context, question, exclude_light_sqls=exclude_light_sqls)
+        elif tool_name == "validate_sql":
+            sql_text = parameters.get("sql")
+            if not sql_text:
+                raise ToolExecutionError("sql parameter is required")
+            result = await handler(context, sql_text)
         else:
             raise ToolExecutionError(f"No handler implemented for tool: {tool_name}")
 

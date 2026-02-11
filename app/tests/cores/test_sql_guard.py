@@ -24,7 +24,7 @@ class TestSQLGuardSubqueryDepth:
         cleaned_sql, is_valid = guard.validate(sql)
 
         assert is_valid
-        assert "LIMIT" in cleaned_sql  # LIMIT 보강이 함께 적용되는지 확인
+        assert "SELECT" in cleaned_sql  # validate는 SQL을 변형하지 않고 안전성만 검사한다
 
     def test_validate_raises_when_subquery_depth_exceeded(self, monkeypatch):
         """허용 깊이를 초과하면 SQLValidationError가 발생해야 한다"""

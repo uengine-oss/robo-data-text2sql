@@ -19,8 +19,9 @@ import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Request
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from pydantic import BaseModel, Field
+from starlette.requests import Request
 
 from app.config import settings
 from app.deps import get_db_connection, get_neo4j_session

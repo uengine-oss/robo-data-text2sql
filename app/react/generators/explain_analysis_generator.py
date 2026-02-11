@@ -12,12 +12,11 @@ import asyncpg
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from app.config import settings
-from app.core.sql_exec import SQLExecutionError, SQLExecutor
-from app.core.sql_guard import SQLGuard, SQLValidationError
 from app.react.llm_factory import ReactLLMHandle, create_react_llm
 from app.react.prompts import get_prompt_text
 from app.react.utils import XmlUtil
 from app.react.utils.db_query_builder import ExecutionPlanResult, get_query_builder, TableMetadata
+from app.react.generators._repro_log import PromptMeta, log_llm_repro
 from app.react.utils.log_sanitize import sanitize_for_log
 from app.smart_logger import SmartLogger
 
@@ -33,27 +32,10 @@ class ExplainAnalysisGeneratorError(Exception):
 
 
 @dataclass
-class ValidationQuery:
-    query_id: str
-    reason: str
-    sql: str
-
-
-@dataclass
-class ValidationQueryResult:
-    query: ValidationQuery
-    success: bool
-    row_count: Optional[int] = None
-    execution_time_ms: Optional[float] = None
-    columns: List[str] = field(default_factory=list)
-    rows: List[List[Any]] = field(default_factory=list)
-    error_message: Optional[str] = None
-
-
-@dataclass
 class ExplainAnalysisLLMResponse:
-    risk_summary: str
-    validation_queries: List[ValidationQuery]
+    verdict: str
+    reason: str
+    suggested_fixes: List[str]
 
     @classmethod
     def from_xml(
@@ -64,7 +46,7 @@ class ExplainAnalysisLLMResponse:
     ) -> "ExplainAnalysisLLMResponse":
         raw = (xml_text or "").strip()
 
-        normalized_info = _normalize_llm_validation_plan_xml(raw)
+        normalized_info = _normalize_llm_explain_verdict_xml(raw)
         if normalized_info.get("trimmed") or normalized_info.get("steps"):
             SmartLogger.log(
                 "WARNING",
@@ -88,7 +70,7 @@ class ExplainAnalysisLLMResponse:
         sanitized = XmlUtil.sanitize_xml_text(raw)
         repaired = XmlUtil.repair_llm_xml_text(
             sanitized,
-            text_tag_names=["note", "summary", "reason", "sql"],
+            text_tag_names=["note", "verdict", "reason", "fix"],
             repair_parameters_text_only=False,
         )
         if repaired != sanitized:
@@ -114,35 +96,38 @@ class ExplainAnalysisLLMResponse:
                 f"LLM 응답 XML 파싱 실패: {exc}"
             ) from exc
 
-        if root.tag != "validation_plan":
-            candidate = root.find("validation_plan")
+        # New schema: <explain_verdict>...</explain_verdict> (no validation queries)
+        if root.tag != "explain_verdict":
+            candidate = root.find("explain_verdict")
             if candidate is None:
+                # Backward compatibility: accept old validation_plan and map to FAIL with reason only.
+                legacy = root.find("validation_plan")
+                if legacy is not None:
+                    legacy_reason = (legacy.findtext("./risk_analysis/summary") or "").strip()
+                    return cls(
+                        verdict="FAIL" if legacy_reason else "",
+                        reason=legacy_reason,
+                        suggested_fixes=[],
+                    )
                 raise ExplainAnalysisGeneratorError(
-                    "LLM 응답에서 <validation_plan> 노드를 찾을 수 없습니다."
+                    "LLM 응답에서 <explain_verdict> 노드를 찾을 수 없습니다."
                 )
             root = candidate
 
-        summary = (root.findtext("./risk_analysis/summary") or "").strip()
-        queries: List[ValidationQuery] = []
-        for idx, query_el in enumerate(root.findall("./queries/query"), start=1):
-            query_id = query_el.get("id") or str(idx)
-            reason = (query_el.findtext("reason") or "").strip()
-            sql_text = (query_el.findtext("sql") or "").strip()
-            if not sql_text:
-                logger.warning("LLM validation query #%s 에 SQL 내용이 없습니다.", query_id)
-                continue
-            queries.append(
-                ValidationQuery(
-                    query_id=query_id,
-                    reason=reason,
-                    sql=sql_text,
-                )
-            )
+        verdict = (root.findtext("verdict") or "").strip().upper()
+        reason = (root.findtext("reason") or "").strip()
+        fixes: List[str] = []
+        for fix_el in root.findall("./suggested_fixes/fix"):
+            text = (fix_el.text or "").strip()
+            if text:
+                fixes.append(text)
 
-        if not queries:
-            logger.warning("LLM 응답에서 실행할 검증 쿼리가 생성되지 않았습니다.")
+        # Per policy: reason/fixes should be present only when FAIL.
+        if verdict == "PASS":
+            reason = ""
+            fixes = []
 
-        return cls(risk_summary=summary, validation_queries=queries)
+        return cls(verdict=verdict, reason=reason, suggested_fixes=fixes)
 
 
 @dataclass
@@ -150,9 +135,10 @@ class ExplainAnalysisResult:
     input_sql: str
     execution_plan: ExecutionPlanResult
     table_metadata: List[TableMetadata]
-    risk_analysis_summary: str
-    validation_results: List[ValidationQueryResult]
-    llm_raw_response: str
+    verdict: str
+    fail_reason: str
+    suggested_fixes: List[str] = field(default_factory=list)
+    llm_raw_response: str = ""
 
     def to_xml_str(self) -> str:
         parts: List[str] = ["<explain_analysis_result>"]
@@ -199,53 +185,15 @@ class ExplainAnalysisResult:
             parts.append("</table>")
         parts.append("</table_metadata>")
 
-        parts.append("<risk_analysis>")
-        parts.append(f"<summary>{_to_cdata(self.risk_analysis_summary)}</summary>")
-        parts.append("</risk_analysis>")
-
-        parts.append("<validation_queries>")
-        for result in self.validation_results:
-            parts.append(f'<validation_query id="{xml_escape(result.query.query_id)}">')
-            parts.append(f"<reason>{_to_cdata(result.query.reason)}</reason>")
-            parts.append(f"<sql>{_to_cdata(result.query.sql)}</sql>")
-            parts.append("<execution>")
-            parts.append(
-                f"<status>{'success' if result.success else 'error'}</status>"
-            )
-            if result.row_count is not None:
-                parts.append(f"<row_count>{result.row_count}</row_count>")
-            if result.execution_time_ms is not None:
-                parts.append(
-                    f"<execution_time_ms>{result.execution_time_ms}</execution_time_ms>"
-                )
-            if result.columns:
-                parts.append("<columns>")
-                for column in result.columns:
-                    parts.append(f"<column>{xml_escape(column)}</column>")
-                parts.append("</columns>")
-            if result.rows:
-                parts.append("<rows>")
-                for idx, row in enumerate(result.rows, start=1):
-                    parts.append(f'<row index="{idx}">')
-                    for col_idx, value in enumerate(row):
-                        column_name = (
-                            result.columns[col_idx]
-                            if col_idx < len(result.columns)
-                            else f"column_{col_idx+1}"
-                        )
-                        cell_value = "" if value is None else str(value)
-                        parts.append(
-                            f'<value column="{xml_escape(column_name, {"\"": "&quot;"})}">{_to_cdata(cell_value)}</value>'
-                        )
-                    parts.append("</row>")
-                parts.append("</rows>")
-            if result.error_message:
-                parts.append(
-                    f"<error_message>{_to_cdata(result.error_message)}</error_message>"
-                )
-            parts.append("</execution>")
-            parts.append("</validation_query>")
-        parts.append("</validation_queries>")
+        parts.append("<explain_verdict>")
+        parts.append(f"<verdict>{xml_escape(self.verdict or '')}</verdict>")
+        if (self.verdict or "").upper() == "FAIL":
+            parts.append(f"<reason>{_to_cdata(self.fail_reason or '')}</reason>")
+            parts.append("<suggested_fixes>")
+            for fix in self.suggested_fixes or []:
+                parts.append(f"<fix>{_to_cdata(str(fix))}</fix>")
+            parts.append("</suggested_fixes>")
+        parts.append("</explain_verdict>")
         parts.append("</explain_analysis_result>")
         return "\n".join(parts)
 
@@ -255,12 +203,15 @@ class ExplainAnalysisGenerator:
 
     def __init__(self):
         self.prompt_text = get_prompt_text("explain_analysis_prompt.xml")
+        self.prompt_meta = PromptMeta(prompt_file="explain_analysis_prompt.xml", prompt_text=self.prompt_text)
         self.llm_handle: ReactLLMHandle = create_react_llm(
             purpose="explain-analysis",
-            thinking_level="low",
+            thinking_level=None,
             system_prompt=self.prompt_text,
-            allow_context_cache=True,
+            allow_context_cache=False,
             include_thoughts=False,
+            temperature=0.0,
+            use_light=True
         )
         self.db_type = settings.target_db_type
 
@@ -270,6 +221,7 @@ class ExplainAnalysisGenerator:
         sql: str,
         db_conn: asyncpg.Connection,
         react_run_id: Optional[str] = None,
+        max_sql_seconds: Optional[int] = None,
     ) -> ExplainAnalysisResult:
         sql_text = (sql or "").strip()
         if not sql_text:
@@ -310,39 +262,49 @@ class ExplainAnalysisGenerator:
             ),
         )
 
-        prompt_input = self._build_prompt_input(
-            sql=sql_text,
-            execution_plan=execution_plan,
-            table_metadata=table_metadata,
-        )
+        # Policy: decide PASS/FAIL by time limit. Only call LLM when FAIL to get reason/fixes.
+        limit_ms: Optional[int] = None
+        if max_sql_seconds is not None:
+            try:
+                limit_ms = int(max(1, int(max_sql_seconds)) * 1000)
+            except Exception:
+                limit_ms = None
 
-        llm_response_text = await self._call_llm(prompt_input, react_run_id=react_run_id)
-        parsed_response = ExplainAnalysisLLMResponse.from_xml(
-            llm_response_text,
-            react_run_id=react_run_id,
-        )
+        exec_ms = execution_plan.execution_time_ms
+        is_over_limit = bool(limit_ms and exec_ms and exec_ms > limit_ms)
 
-        validation_results = await self._execute_validation_queries(
-            parsed_response.validation_queries,
-            db_conn=db_conn,
-            react_run_id=react_run_id,
-        )
+        llm_response_text = ""
+        verdict = "FAIL" if is_over_limit else "PASS"
+        fail_reason = ""
+        suggested_fixes: List[str] = []
+        if verdict == "FAIL":
+            prompt_input = self._build_prompt_input(
+                sql=sql_text,
+                execution_plan=execution_plan,
+                table_metadata=table_metadata,
+                max_sql_seconds=int(max_sql_seconds or 1),
+            )
+            llm_response_text = await self._call_llm(prompt_input, react_run_id=react_run_id)
+            parsed = ExplainAnalysisLLMResponse.from_xml(
+                llm_response_text,
+                react_run_id=react_run_id,
+            )
+            fail_reason = (parsed.reason or "").strip()
+            suggested_fixes = list(parsed.suggested_fixes or [])
 
         return ExplainAnalysisResult(
             input_sql=sql_text,
             execution_plan=execution_plan,
             table_metadata=table_metadata,
-            risk_analysis_summary=parsed_response.risk_summary,
-            validation_results=validation_results,
+            verdict=verdict,
+            fail_reason=fail_reason,
+            suggested_fixes=suggested_fixes,
             llm_raw_response=llm_response_text,
         )
 
     async def _call_llm(self, input_xml: str, *, react_run_id: Optional[str] = None) -> str:
         llm = self.llm_handle.llm
-        use_cache = self.llm_handle.uses_context_cache
-        messages = [HumanMessage(content=input_xml)]
-        if not use_cache:
-            messages.insert(0, SystemMessage(content=self.prompt_text))
+        messages = [SystemMessage(content=self.prompt_text), HumanMessage(content=input_xml)]
         SmartLogger.log(
             "INFO",
             "react.explain.llm.request",
@@ -351,11 +313,10 @@ class ExplainAnalysisGenerator:
                 {
                     "react_run_id": react_run_id,
                     "model": getattr(llm, "model_name", None) or getattr(llm, "model", None),
-                    "uses_context_cache": use_cache,
-                    "cached_content": getattr(self.llm_handle, "cached_content_name", None),
                     "user_prompt": input_xml,
                 }
             ),
+            max_inline_chars=0,
         )
         llm_started = time.perf_counter()
         try:
@@ -375,6 +336,24 @@ class ExplainAnalysisGenerator:
                         "user_prompt": input_xml,
                     }
                 ),
+                max_inline_chars=0,
+            )
+            log_llm_repro(
+                level="ERROR",
+                message="react.llm.repro.explain_analysis.error",
+                category="react.llm.repro.explain_analysis",
+                react_run_id=react_run_id,
+                generator="explain_analysis_generator",
+                llm_provider=self.llm_handle.provider,
+                llm_model=self.llm_handle.model,
+                prompt=self.prompt_meta,
+                input_payload={"input_xml": input_xml},
+                messages_payload={"system": self.prompt_text, "human": input_xml},
+                mode="xml_text",
+                elapsed_ms=llm_elapsed_ms,
+                response_raw=None,
+                parsed=None,
+                exception=exc,
             )
             raise
         llm_elapsed_ms = (time.perf_counter() - llm_started) * 1000.0
@@ -401,133 +380,25 @@ class ExplainAnalysisGenerator:
                     "assistant_response": content,
                 }
             ),
+            max_inline_chars=0,
+        )
+        log_llm_repro(
+            level="INFO",
+            message="react.llm.repro.explain_analysis.ok",
+            category="react.llm.repro.explain_analysis",
+            react_run_id=react_run_id,
+            generator="explain_analysis_generator",
+            llm_provider=self.llm_handle.provider,
+            llm_model=self.llm_handle.model,
+            prompt=self.prompt_meta,
+            input_payload={"input_xml": input_xml},
+            messages_payload={"system": self.prompt_text, "human": input_xml},
+            mode="xml_text",
+            elapsed_ms=llm_elapsed_ms,
+            response_raw=content,
+            parsed={"assistant_response": content},
         )
         return content
-
-    async def _execute_validation_queries(
-        self,
-        queries: List[ValidationQuery],
-        *,
-        db_conn: asyncpg.Connection,
-        react_run_id: Optional[str] = None,
-    ) -> List[ValidationQueryResult]:
-        if not queries:
-            return []
-
-        guard = SQLGuard()
-        executor = SQLExecutor()
-        executor.timeout = min(executor.timeout, settings.explain_analysis_timeout_seconds)
-
-        results: List[ValidationQueryResult] = []
-        for query in queries:
-            result = await self._run_single_validation_query(
-                query,
-                guard=guard,
-                executor=executor,
-                db_conn=db_conn,
-                react_run_id=react_run_id,
-            )
-            results.append(result)
-        return results
-
-    async def _run_single_validation_query(
-        self,
-        query: ValidationQuery,
-        *,
-        guard: SQLGuard,
-        executor: SQLExecutor,
-        db_conn: asyncpg.Connection,
-        react_run_id: Optional[str] = None,
-    ) -> ValidationQueryResult:
-        SmartLogger.log(
-            "INFO",
-            "react.explain.validation.request",
-            category="react.explain.validation.request",
-            params=sanitize_for_log(
-                {
-                    "react_run_id": react_run_id,
-                    "query_id": query.query_id,
-                    "reason": query.reason,
-                    "sql": query.sql,
-                }
-            ),
-        )
-        started = time.perf_counter()
-        try:
-            validated_sql, _ = guard.validate(query.sql)
-            execution_result = await executor.execute_query(db_conn, validated_sql)
-            formatted = SQLExecutor.format_results_for_json(execution_result)
-            elapsed_ms = (time.perf_counter() - started) * 1000.0
-            SmartLogger.log(
-                "INFO",
-                "react.explain.validation.response",
-                category="react.explain.validation.response",
-                params=sanitize_for_log(
-                    {
-                        "react_run_id": react_run_id,
-                        "query_id": query.query_id,
-                        "elapsed_ms": elapsed_ms,
-                        "validated_sql": validated_sql,
-                        "result": formatted,
-                    }
-                ),
-            )
-            return ValidationQueryResult(
-                query=query,
-                success=True,
-                row_count=formatted["row_count"],
-                execution_time_ms=formatted["execution_time_ms"],
-                columns=formatted["columns"],
-                rows=formatted["rows"],
-            )
-        except (SQLValidationError, SQLExecutionError) as exc:
-            elapsed_ms = (time.perf_counter() - started) * 1000.0
-            SmartLogger.log(
-                "ERROR",
-                "react.explain.validation.error",
-                category="react.explain.validation.error",
-                params=sanitize_for_log(
-                    {
-                        "react_run_id": react_run_id,
-                        "query_id": query.query_id,
-                        "elapsed_ms": elapsed_ms,
-                        "sql": query.sql,
-                        "exception": repr(exc),
-                        "traceback": traceback.format_exc(),
-                    }
-                ),
-            )
-            logger.warning(
-                "검증 쿼리 실행 실패 (%s): %s", query.query_id, exc, exc_info=True
-            )
-            return ValidationQueryResult(
-                query=query,
-                success=False,
-                error_message=str(exc),
-            )
-        except Exception as exc:  # pragma: no cover - defensive
-            elapsed_ms = (time.perf_counter() - started) * 1000.0
-            SmartLogger.log(
-                "ERROR",
-                "react.explain.validation.error",
-                category="react.explain.validation.error",
-                params=sanitize_for_log(
-                    {
-                        "react_run_id": react_run_id,
-                        "query_id": query.query_id,
-                        "elapsed_ms": elapsed_ms,
-                        "sql": query.sql,
-                        "exception": repr(exc),
-                        "traceback": traceback.format_exc(),
-                    }
-                ),
-            )
-            logger.exception("검증 쿼리 실행 중 알 수 없는 오류 발생")
-            return ValidationQueryResult(
-                query=query,
-                success=False,
-                error_message=f"Unexpected error: {exc}",
-            )
 
     def _build_prompt_input(
         self,
@@ -535,10 +406,12 @@ class ExplainAnalysisGenerator:
         sql: str,
         execution_plan: ExecutionPlanResult,
         table_metadata: List[TableMetadata],
+        max_sql_seconds: int,
     ) -> str:
         plan_json = json.dumps(execution_plan.raw_plan)
         parts: List[str] = ["<input>"]
         parts.append(f"<sql>{_to_cdata(sql)}</sql>")
+        parts.append(f"<max_sql_seconds>{int(max_sql_seconds)}</max_sql_seconds>")
         parts.append("<execution_plan>")
         parts.append(f"<total_cost>{execution_plan.total_cost}</total_cost>")
         parts.append(
@@ -579,10 +452,10 @@ class ExplainAnalysisGenerator:
         return "\n".join(parts)
 
 
-def _normalize_llm_validation_plan_xml(text: str) -> dict:
+def _normalize_llm_explain_verdict_xml(text: str) -> dict:
     """
     Best-effort normalization for LLM responses that are supposed to contain a single
-    <validation_plan>...</validation_plan> XML document.
+    <explain_verdict>...</explain_verdict> XML document.
 
     Handles common wrappers/noise:
     - Top-level <![CDATA[ ... ]]>
@@ -623,8 +496,8 @@ def _normalize_llm_validation_plan_xml(text: str) -> dict:
         s = inner.strip()
         steps.append("top_level_cdata_unwrapped")
 
-    # 3) Extract the first <validation_plan>...</validation_plan> block anywhere in the text.
-    extract_info = _extract_first_tag_block(s, "validation_plan")
+    # 3) Extract the first <explain_verdict>...</explain_verdict> block anywhere in the text.
+    extract_info = _extract_first_tag_block(s, "explain_verdict")
     if extract_info.get("found"):
         extracted_xml = str(extract_info.get("xml") or "").strip()
         if extracted_xml and extracted_xml != s:
@@ -634,7 +507,7 @@ def _normalize_llm_validation_plan_xml(text: str) -> dict:
             trim_suffix_len = int(extract_info.get("trim_suffix_len") or 0)
             trim_suffix_preview = str(extract_info.get("trim_suffix_preview") or "")
             s = extracted_xml
-            steps.append("validation_plan_extracted")
+            steps.append("explain_verdict_extracted")
 
     return {
         "xml": s,

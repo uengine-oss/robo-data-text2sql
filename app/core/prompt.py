@@ -1,12 +1,13 @@
 """LangChain prompts and SQL generation chain"""
+from typing import Dict, List
+
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from langchain_openai import ChatOpenAI
 
-from app.config import settings
+from app.core.llm_factory import create_llm
 
 
-SQL_GENERATION_TEMPLATE = """You are a senior database engineer. Your task is to generate a SINGLE valid SQL SELECT query based on the user's question.
+SQL_GENERATION_TEMPLATE = """You are a senior database engineer. Your task is to generate a SINGLE valid PostgreSQL SELECT query based on the user's question.
 
 User Question:
 {question}
@@ -17,21 +18,15 @@ Available Schema:
 Constraints and Rules:
 1. Generate ONLY a SELECT statement - no INSERT, UPDATE, DELETE, or DDL
 2. Use ONLY the tables and columns listed in the schema above
-3. ALWAYS use the EXACT table reference format shown in the schema:
-   - If table is shown as "datasource.schema.table", use that exact 3-part format (for MindsDB federated queries)
-   - If table is shown as "schema.table", use that 2-part format
-4. IMPORTANT: For MindsDB queries, use BACKTICKS (`) to quote identifiers that contain uppercase letters or special characters:
-   - Example: posgres.rwis.`AAA` or posgres.`common_db`.`customers`
-   - Datasource and schema names can be lowercase without quotes
-   - Table and column names with uppercase MUST use backticks
-5. Preserve the exact letter case of table/column names provided in the schema; do NOT lowercase identifiers
-6. Follow the suggested joins if tables need to be joined
-7. Do NOT use CTEs (WITH clauses) unless absolutely necessary
-8. Do NOT add SQL comments (-- or /* */)
-9. The query will automatically have a LIMIT applied, don't worry about it
-10. Use appropriate WHERE clauses to filter data efficiently
-11. Prefer simple queries over complex nested subqueries
-12. Return properly formatted column aliases for clarity
+3. Always SCHEMA-QUALIFY table names and DOUBLE-QUOTE ALL identifiers exactly as shown in the schema (case-sensitive), e.g. "sample"."T02"."C01"
+4. Preserve the exact letter case of table/column names provided in the schema; do NOT lowercase identifiers
+5. Follow the suggested joins if tables need to be joined
+6. Do NOT use CTEs (WITH clauses) unless absolutely necessary
+7. Do NOT add SQL comments (-- or /* */)
+8. The query will automatically have a LIMIT applied, don't worry about it
+9. Use appropriate WHERE clauses to filter data efficiently
+10. Prefer simple queries over complex nested subqueries
+11. Return properly formatted column aliases for clarity
 
 Additional Context:
 {join_hints}
@@ -49,11 +44,13 @@ class SQLChain:
     """SQL generation chain using LangChain"""
     
     def __init__(self):
-        self.llm = ChatOpenAI(
-            model=settings.openai_llm_model,
+        # Unified LLM (provider/model) via core factory
+        self.llm = create_llm(
+            purpose="sql-generation",
+            thinking_level="low",
+            include_thoughts=False,
             temperature=0,
-            api_key=settings.openai_api_key
-        )
+        ).llm
         self.prompt = ChatPromptTemplate.from_template(SQL_GENERATION_TEMPLATE)
         self.output_parser = StrOutputParser()
         

@@ -2,25 +2,21 @@ from app.react.generators.explain_analysis_generator import ExplainAnalysisLLMRe
 
 
 def test_explain_analysis_from_xml_repairs_text_fields_with_angle_brackets() -> None:
-    # '<schema>' in free text and '<' operators inside <sql>/<reason> would normally break XML parsing.
-    xml_text = """<validation_plan>
-  <risk_analysis>
-    <summary>Need a <schema> tag and 2 < 3 comparisons can appear</summary>
-  </risk_analysis>
-  <queries>
-    <query id="1">
-      <reason>Verify selectivity where 2 < 3 is present in predicates</reason>
-      <sql>SELECT 1 WHERE 2 < 3;</sql>
-    </query>
-  </queries>
-</validation_plan>
+    # '<' in free text can break XML; the parser should still extract the verdict/reason/fixes.
+    xml_text = """<explain_verdict>
+  <verdict>FAIL</verdict>
+  <reason>Need a &lt;schema&gt; tag and 2 &lt; 3 comparisons can appear</reason>
+  <suggested_fixes>
+    <fix>Add a date filter where 2 &lt; 3 is present in predicates</fix>
+  </suggested_fixes>
+</explain_verdict>
 """
 
     parsed = ExplainAnalysisLLMResponse.from_xml(xml_text)
-    assert "<schema>" in parsed.risk_summary
-    assert "2 < 3" in parsed.risk_summary
-    assert len(parsed.validation_queries) == 1
-    assert "2 < 3" in parsed.validation_queries[0].reason
-    assert "2 < 3" in parsed.validation_queries[0].sql
+    assert parsed.verdict == "FAIL"
+    assert "<schema>" in parsed.reason
+    assert "2 < 3" in parsed.reason
+    assert len(parsed.suggested_fixes) == 1
+    assert "2 < 3" in parsed.suggested_fixes[0]
 
 
