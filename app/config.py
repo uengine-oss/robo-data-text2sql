@@ -12,15 +12,16 @@ class Settings(BaseSettings):
     neo4j_password: str = "password123"
     neo4j_database: str = "neo4j"
 
-    # Target Database
-    target_db_type: Literal["postgresql", "mysql", "oracle"] = "postgresql"
+    # Target Database endpoint (MindsDB MySQL protocol)
+    target_db_type: Literal["mysql", "mariadb"] = "mysql"
     target_db_host: str = "localhost"
-    target_db_port: int = 5432
-    target_db_name: str
-    target_db_user: str
+    target_db_port: int = 47335
+    target_db_name: str = "mindsdb"
+    target_db_user: str = "mindsdb"
     target_db_password: str
+    # Optional schema hints used by some background jobs after datasource is connected.
     target_db_schema: str = "public"
-    target_db_schemas: str = "public"  # Comma-separated list of schemas to access
+    target_db_schemas: str = "public"
     target_db_ssl: str = "disable"  # SSL mode: disable, require, verify-ca, verify-full
 
     # Unified LLM configuration
