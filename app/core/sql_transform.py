@@ -383,4 +383,3 @@ def transform_sql_for_mindsdb(sql: str, datasource: str) -> str:
     s = _dquote_to_backtick(s)
     s = quote_uppercase_identifiers(s)
     return s
-

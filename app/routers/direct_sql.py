@@ -37,7 +37,7 @@ AI_SUMMARY_SYSTEM_PROMPT = (
 
 class DirectSqlRequest(BaseModel):
     sql: str = Field(..., description="실행할 SQL 쿼리")
-    datasource: str = Field(..., description="MindsDB datasource (required; Phase 1 MindsDB-only)")
+    datasource: Optional[str] = Field(default=None, description="MindsDB datasource (required for MindsDB mode only)")
     max_sql_seconds: int = Field(default=60, ge=1, le=3600, description="SQL 실행 최대 허용 시간(초)")
     format_with_ai: bool = Field(default=False, description="AI로 결과 포맷팅 여부")
 
@@ -123,33 +123,16 @@ async def execute_direct_sql(
     executor = SQLExecutor()
     try:
         db_type = str(getattr(settings, "target_db_type", "") or "").strip().lower()
-        # Deterministic pipeline (MindsDB-safe):
-        # 1) Try original validated SQL first (keeps passthrough inner SQL intact)
-        # 2) On failure (MindsDB mode), apply deterministic prepare and retry once
-        attempted_sql = validated_sql
-        try:
-            raw_result = await executor.execute_query(
-                db_conn,
-                attempted_sql,
-                timeout=float(request.max_sql_seconds),
-            )
-        except SQLExecutionError as first_exc:
-            if db_type in {"mysql", "mariadb"}:
-                prep = prepare_sql_for_mindsdb(validated_sql, request.datasource)
-                if prep.sql.strip() != attempted_sql.strip():
-                    attempted_sql = prep.sql
-                    raw_result = await executor.execute_query(
-                        db_conn,
-                        attempted_sql,
-                        timeout=float(request.max_sql_seconds),
-                    )
-                else:
-                    raise first_exc
-            else:
-                raise first_exc
+        # MindsDB mode: always wrap in passthrough form upfront (all schemas supported)
+        if db_type in {"mysql", "mariadb"} and request.datasource:
+            prep = prepare_sql_for_mindsdb(validated_sql, request.datasource)
+            validated_sql = prep.sql
 
-        # Return the SQL that was actually executed
-        validated_sql = attempted_sql
+        raw_result = await executor.execute_query(
+            db_conn,
+            validated_sql,
+            timeout=float(request.max_sql_seconds),
+        )
         formatted = executor.format_results_for_json(raw_result)
         
         execution_time_ms = (time.perf_counter() - start_time) * 1000

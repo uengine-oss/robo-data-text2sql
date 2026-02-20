@@ -4,24 +4,16 @@ MindsDB(MySQL endpoint) SQL preparation / deterministic auto-correct.
 Why this exists
 ---------------
 In Phase 1 this service talks to MindsDB via the MySQL protocol. To query external datasources,
-we often need to:
-- rewrite `schema.table` -> `datasource.schema.table`
-- use MySQL backticks for identifiers (MindsDB requirement)
+we use the MindsDB "passthrough" form:
 
-However, MindsDB also supports "passthrough" derived queries:
+  SELECT * FROM `datasource` ( <inner_sql_in_external_db_dialect> );
 
-  SELECT * FROM <datasource> ( <inner_sql_in_external_db_dialect> );
+In that form, the *inner SQL* is sent directly to the external DB (e.g. PostgreSQL)
+without any MindsDB parsing. This supports ALL schemas and all SQL features natively.
 
-In that form, the *inner SQL* must stay in the external DB dialect (e.g. PostgreSQL uses
-double quotes for identifiers and does NOT accept backticks). Applying a global transform to the
-whole statement corrupts the inner SQL and causes errors like:
-  syntax error near "`"
-
-This module provides a deterministic, low-risk preparation:
-- Detect passthrough form and NEVER run MindsDB identifier-quoting transform on the inner SQL.
-- If the query is already corrupted (e.g. backticks / accidental datasource prefix inside inner),
-  sanitize ONLY the inner SQL and rebuild the passthrough statement.
-- Otherwise (non-passthrough), apply the existing `transform_sql_for_mindsdb()`.
+This module provides deterministic preparation:
+- Detect if SQL is already in passthrough form and leave it unchanged (or sanitize inner if corrupted).
+- Otherwise, wrap the SQL in passthrough form via `transform_sql_for_mindsdb()`.
 """
 
 from __future__ import annotations
@@ -29,6 +21,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
+
 
 from app.core.sql_transform import transform_sql_for_mindsdb
 
@@ -177,15 +170,14 @@ def fix_passthrough_query_if_needed(sql: str, datasource: str) -> Optional[Minds
 def prepare_sql_for_mindsdb(sql: str, datasource: str) -> MindsDBPrepareResult:
     """
     Deterministically prepare SQL for execution via MindsDB MySQL endpoint.
-    - If passthrough: do NOT transform; optionally sanitize inner only.
-    - Else: apply transform_sql_for_mindsdb().
+    - If already passthrough: leave unchanged (optionally sanitize inner).
+    - Otherwise: wrap in passthrough form via transform_sql_for_mindsdb().
     """
     s = (sql or "").strip()
     ds = (datasource or "").strip()
     if not s:
         return MindsDBPrepareResult(sql=s, changed=False, reason="empty_sql", details={})
     if not ds:
-        # Keep behavior consistent with transform_sql_for_mindsdb: datasource required for non-passthrough.
         return MindsDBPrepareResult(sql=s, changed=False, reason="missing_datasource", details={})
 
     if is_passthrough_query(s, ds):
@@ -215,4 +207,3 @@ __all__ = [
     "fix_passthrough_query_if_needed",
     "prepare_sql_for_mindsdb",
 ]
-

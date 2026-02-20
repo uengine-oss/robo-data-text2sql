@@ -9,7 +9,7 @@ from app.deps import get_db_connection
 from app.sanity_checks.result import SanityCheckResult
 
 
-async def check_target_db(*, timeout_seconds: float = 10.0) -> SanityCheckResult:
+async def check_target_db(*, timeout_seconds: float = 30.0) -> SanityCheckResult:
     """
     MindsDB(MySQL endpoint) connectivity sanity check.
 
