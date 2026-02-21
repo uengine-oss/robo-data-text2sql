@@ -33,6 +33,7 @@ async def inspect_text2sql_property_gaps(
     {
       "schemas": [...],
       "table_total": ...,
+      "table_valid_true_count": ...,
       "table_missing_vector": ...,
       "table_missing_embedding_text": ...,
       "table_missing_is_valid": ...,
@@ -52,6 +53,7 @@ async def inspect_text2sql_property_gaps(
       WHERE ($schemas IS NULL OR toLower(COALESCE(t.schema,'')) IN $schemas)
       RETURN
         count(t) AS table_total,
+        count(CASE WHEN t.text_to_sql_is_valid = true THEN 1 END) AS table_valid_true_count,
         count(CASE WHEN (t.text_to_sql_vector IS NULL OR size(coalesce(t.text_to_sql_vector, [])) = 0) THEN 1 END) AS table_missing_vector,
         count(CASE WHEN trim(COALESCE(t.text_to_sql_embedding_text, '')) = '' THEN 1 END) AS table_missing_embedding_text,
         count(CASE WHEN t.text_to_sql_is_valid IS NULL THEN 1 END) AS table_missing_is_valid,
@@ -67,6 +69,7 @@ async def inspect_text2sql_property_gaps(
     }
     RETURN
       table_total,
+      table_valid_true_count,
       table_missing_vector,
       table_missing_embedding_text,
       table_missing_is_valid,
@@ -96,6 +99,7 @@ async def inspect_text2sql_property_gaps(
         "schemas_used": schema_filter_used,
         "schema_filter_fallback_used": bool(fallback_used),
         "table_total": int(data.get("table_total") or 0),
+        "table_valid_true_count": int(data.get("table_valid_true_count") or 0),
         "table_missing_vector": int(data.get("table_missing_vector") or 0),
         "table_missing_embedding_text": int(data.get("table_missing_embedding_text") or 0),
         "table_missing_is_valid": int(data.get("table_missing_is_valid") or 0),
@@ -118,11 +122,17 @@ async def inspect_text2sql_property_gaps(
     # - At least one table exists in graph
     # - Every table misses text_to_sql_vector
     # - Every table misses text_to_sql_embedding_text
+    # - OR no table has text_to_sql_is_valid=true
     # This distinguishes full cold boot from partial drift.
     out["cold_start_detected"] = bool(
         table_total > 0
-        and int(out.get("table_missing_vector") or 0) >= table_total
-        and int(out.get("table_missing_embedding_text") or 0) >= table_total
+        and (
+            (
+                int(out.get("table_missing_vector") or 0) >= table_total
+                and int(out.get("table_missing_embedding_text") or 0) >= table_total
+            )
+            or int(out.get("table_valid_true_count") or 0) == 0
+        )
     )
     out["needs_repair"] = bool(
         missing_total >= int(getattr(settings, "text2sql_runtime_repair_min_missing_to_trigger", 1) or 1)

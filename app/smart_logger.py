@@ -74,7 +74,7 @@ class SmartLogger:
             ]
             for dir_path in dir_paths:
                 if self.remove_log_on_create and os.path.exists(dir_path):
-                    self._remove_directory_with_retry(dir_path)
+                    shutil.rmtree(dir_path)
             for dir_path in dir_paths:
                 os.makedirs(dir_path, exist_ok=True)
     
