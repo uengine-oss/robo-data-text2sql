@@ -85,6 +85,22 @@ def _ident_variants(schema: str, table: str, column: Optional[str] = None) -> Li
     return out
 
 
+def _parse_fqn_tail3(fqn: str) -> Optional[Tuple[str, str, str]]:
+    """
+    Parse Column.fqn as (schema, table, column) using the rightmost 3 segments.
+    Supports both:
+    - schema.table.column
+    - db.schema.table.column
+    """
+    parts = [p.strip() for p in str(fqn or "").split(".") if p.strip()]
+    if len(parts) < 3:
+        return None
+    schema_l, table_l, col_l = parts[-3].lower(), parts[-2].lower(), parts[-1].lower()
+    if not schema_l or not table_l or not col_l:
+        return None
+    return schema_l, table_l, col_l
+
+
 async def _preview_query(
     *,
     db_conn: Any,
@@ -318,12 +334,13 @@ async def ensure_text2sql_validity_flags_mindsdb(
             if not fqn or fqn.count(".") < 2:
                 if schema_prop and display_name and col_name:
                     fqn = f"{schema_prop}.{display_name}.{col_name}".lower()
-            parts = [p.strip() for p in fqn.split(".") if p.strip()]
-            if len(parts) < 3:
+            parsed = _parse_fqn_tail3(fqn)
+            if parsed is None:
                 continue
-            col_name_src = col_name or parts[2]
-            table_name_src = display_name or parts[1]
-            schema_src = schema_prop or parts[0]
+            schema_l, table_l, col_l = parsed
+            col_name_src = col_name or col_l
+            table_name_src = display_name or table_l
+            schema_src = schema_prop or schema_l
             col_targets.append(
                 _ColumnTarget(
                     cid=cid,
@@ -332,9 +349,9 @@ async def ensure_text2sql_validity_flags_mindsdb(
                     schema_prop=schema_src,
                     table_name=table_name_src,
                     col_name=col_name_src,
-                    schema_l=parts[0].lower(),
-                    table_l=parts[1].lower(),
-                    col_l=parts[2].lower(),
+                    schema_l=schema_l,
+                    table_l=table_l,
+                    col_l=col_l,
                 )
             )
 

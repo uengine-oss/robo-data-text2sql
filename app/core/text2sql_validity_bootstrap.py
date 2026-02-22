@@ -83,6 +83,22 @@ class _Neo4jColumnKey:
     col_l: str
 
 
+def _parse_fqn_tail3(fqn: str) -> Optional[Tuple[str, str, str]]:
+    """
+    Parse Column.fqn as (schema, table, column) using the rightmost 3 segments.
+    Supports both:
+    - schema.table.column
+    - db.schema.table.column
+    """
+    parts = [p.strip() for p in str(fqn or "").split(".") if p.strip()]
+    if len(parts) < 3:
+        return None
+    schema_l, table_l, col_l = parts[-3].lower(), parts[-2].lower(), parts[-1].lower()
+    if not schema_l or not table_l or not col_l:
+        return None
+    return schema_l, table_l, col_l
+
+
 async def has_any_text2sql_validity_flags(*, neo4j_session, schemas: Optional[Sequence[str]] = None) -> bool:
     """
     Returns True if there exists at least one (:Table) node with text_to_sql_is_valid in the target schemas.
@@ -282,10 +298,10 @@ async def ensure_text2sql_validity_flags(
                 coln = str(r.get("column_name") or "").strip()
                 if schema_prop and display and coln:
                     fqn = f"{schema_prop}.{display}.{coln}".lower()
-            parts = [p.strip() for p in fqn.split(".") if p.strip()]
-            if len(parts) < 3:
+            parsed = _parse_fqn_tail3(fqn)
+            if parsed is None:
                 continue
-            schema_l, table_l, col_l = parts[0].lower(), parts[1].lower(), parts[2].lower()
+            schema_l, table_l, col_l = parsed
             col_keys.append(_Neo4jColumnKey(fqn=fqn.lower(), schema_l=schema_l, table_l=table_l, col_l=col_l))
 
         # De-dup columns by fqn
