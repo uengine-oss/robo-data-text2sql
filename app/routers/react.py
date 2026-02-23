@@ -279,37 +279,11 @@ def _maybe_followup_transform_sql(
 
     def _mindsdb_sql_to_postgres(sql: str, datasource: str) -> str:
         """
-        Convert a MindsDB-addressed SQL snippet into PostgreSQL dialect:
-        - Remove datasource prefix: datasource.<schema>.<table> -> <schema>.<table>
-        - Convert MySQL backticks around identifiers to PostgreSQL double quotes
-        - Keep single-quoted string literals intact
+        Convert a MindsDB-addressed SQL snippet into PostgreSQL dialect.
+        Delegates to the shared _mysql_to_postgres_sql converter.
         """
-        inner = str(sql or "")
-        ds = (datasource or "").strip()
-        if not inner.strip() or not ds:
-            return inner.strip()
-
-        # Protect single-quoted string literals (e.g., '청주정수장')
-        placeholders: Dict[str, str] = {}
-        counter = 0
-
-        def _protect_str(m: re.Match) -> str:
-            nonlocal counter
-            key = f"__xstrx_{counter}__"
-            counter += 1
-            placeholders[key] = m.group(0)
-            return key
-
-        tmp = re.sub(r"'(?:[^']|'')*'", _protect_str, inner)
-
-        # Remove datasource prefix at identifier boundaries: postgresql.`RWIS`... / postgresql.RWIS...
-        tmp = re.sub(rf"(?i)\b{re.escape(ds)}\s*\.", "", tmp)
-        # Backticks -> double quotes (identifiers)
-        tmp = re.sub(r"`([^`]*)`", r'"\1"', tmp)
-
-        for k, v in placeholders.items():
-            tmp = tmp.replace(k, v)
-        return tmp.strip()
+        from app.core.sql_mindsdb_prepare import _mysql_to_postgres_sql
+        return _mysql_to_postgres_sql(sql, datasource)
 
     datasource = _detect_datasource(last_sql)
     if not datasource:

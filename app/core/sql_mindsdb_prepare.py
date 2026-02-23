@@ -11,9 +11,16 @@ we use the MindsDB "passthrough" form:
 In that form, the *inner SQL* is sent directly to the external DB (e.g. PostgreSQL)
 without any MindsDB parsing. This supports ALL schemas and all SQL features natively.
 
+IMPORTANT — Why we ALWAYS use passthrough form:
+MindsDB's "datasource.schema.table" addressing mode strips MySQL backticks when proxying
+to PostgreSQL, which causes PostgreSQL to lowercase UPPERCASE identifiers (e.g.
+`RWIS`.`RDF01HH_TB` → rwis.rdf01hh_tb → "does not exist").
+Passthrough form bypasses MindsDB's parser entirely and sends the inner SQL directly
+to PostgreSQL with proper double-quote quoting, preserving case.
+
 This module provides deterministic preparation:
 - Detect if SQL is already in passthrough form and leave it unchanged (or sanitize inner if corrupted).
-- Otherwise, wrap the SQL in passthrough form via `transform_sql_for_mindsdb()`.
+- Otherwise, convert MySQL-style SQL to PostgreSQL-dialect and wrap in passthrough form.
 """
 
 from __future__ import annotations
@@ -21,9 +28,6 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
-
-
-from app.core.sql_transform import transform_sql_for_mindsdb
 
 
 @dataclass(frozen=True)
@@ -106,16 +110,17 @@ def _extract_passthrough_inner(sql: str, datasource: str) -> Optional[Dict[str, 
     }
 
 
-def _passthrough_sanitize_inner_for_postgres(inner_sql: str, datasource: str) -> str:
+def _mysql_to_postgres_sql(sql: str, datasource: str) -> str:
     """
-    Best-effort sanitize for Postgres-executed inner SQL:
-    - Remove accidental datasource prefix: datasource.<schema>.<table> -> <schema>.<table>
-    - Convert MySQL-style backticks around identifiers to PostgreSQL double quotes.
-      (Does NOT touch single-quoted string literals.)
+    Convert MySQL-style SQL to PostgreSQL-compatible SQL:
+    - Remove datasource prefix: datasource.<schema>.<table> -> <schema>.<table>
+    - Backtick-quoted function calls (`FUNC`(...)) -> unquoted (PostgreSQL is case-insensitive for functions)
+    - Remaining backtick-quoted identifiers -> PostgreSQL double-quoted identifiers
+    - Single-quoted string literals are PROTECTED from modification.
     """
-    inner = str(inner_sql or "")
+    inner = str(sql or "")
     ds = (datasource or "").strip()
-    if not inner.strip() or not ds:
+    if not inner.strip():
         return inner.strip()
 
     # Protect single-quoted string literals
@@ -131,17 +136,34 @@ def _passthrough_sanitize_inner_for_postgres(inner_sql: str, datasource: str) ->
 
     tmp = re.sub(r"'(?:[^']|'')*'", _protect_str, inner)
 
-    # Remove datasource prefix at identifier boundaries: postgresql.`RWIS`... / postgresql."RWIS"... / postgresql.RWIS...
-    tmp = re.sub(rf"(?i)\b{re.escape(ds)}\s*\.", "", tmp)
+    # Remove datasource prefix at identifier boundaries:
+    # postgresql.`RWIS`... / postgresql."RWIS"... / postgresql.RWIS...
+    if ds:
+        tmp = re.sub(rf"(?i)\b{re.escape(ds)}\s*\.", "", tmp)
 
-    # Backticks -> double quotes (identifiers)
+    # Step 1: Backtick-quoted function names (followed by '(') -> remove backticks only.
+    # e.g. `SUBSTR`(...) -> SUBSTR(...)
+    # PostgreSQL is case-insensitive for function names when unquoted.
+    tmp = re.sub(r"`([^`]*)`(?=\s*\()", lambda m: m.group(1), tmp)
+
+    # Step 2: Remaining backtick-quoted identifiers -> PostgreSQL double quotes.
+    # e.g. `RWIS`.`RDF01HH_TB` -> "RWIS"."RDF01HH_TB"
+    # This preserves case for UPPERCASE table/schema/column names in PostgreSQL.
     tmp = re.sub(r"`([^`]*)`", r'"\1"', tmp)
 
-    # Restore strings
+    # Restore string literals
     for k, v in placeholders.items():
         tmp = tmp.replace(k, v)
 
     return tmp.strip()
+
+
+def _passthrough_sanitize_inner_for_postgres(inner_sql: str, datasource: str) -> str:
+    """
+    Best-effort sanitize for Postgres-executed inner SQL.
+    Delegates to the shared _mysql_to_postgres_sql converter.
+    """
+    return _mysql_to_postgres_sql(inner_sql, datasource)
 
 
 def fix_passthrough_query_if_needed(sql: str, datasource: str) -> Optional[MindsDBPrepareResult]:
@@ -167,11 +189,29 @@ def fix_passthrough_query_if_needed(sql: str, datasource: str) -> Optional[Minds
     )
 
 
+def _wrap_as_passthrough(inner_sql: str, datasource: str) -> str:
+    """
+    Wrap SQL in MindsDB passthrough form:
+      SELECT * FROM `datasource` ( <inner_sql> )
+
+    The inner SQL is sent directly to the external DB (PostgreSQL) without
+    MindsDB parsing, preserving all SQL features and identifier casing.
+    """
+    inner = (inner_sql or "").strip().rstrip(";").strip()
+    ds = str(datasource or "").strip()
+    return f"SELECT * FROM `{ds}` (\n{inner}\n)"
+
+
 def prepare_sql_for_mindsdb(sql: str, datasource: str) -> MindsDBPrepareResult:
     """
     Deterministically prepare SQL for execution via MindsDB MySQL endpoint.
+
+    ALWAYS uses passthrough form to avoid MindsDB stripping backticks and
+    causing PostgreSQL to lowercase UPPERCASE identifiers.
+
     - If already passthrough: leave unchanged (optionally sanitize inner).
-    - Otherwise: wrap in passthrough form via transform_sql_for_mindsdb().
+    - Otherwise: convert MySQL-style backticks to PostgreSQL double-quotes
+      and wrap in passthrough form.
     """
     s = (sql or "").strip()
     ds = (datasource or "").strip()
@@ -191,12 +231,17 @@ def prepare_sql_for_mindsdb(sql: str, datasource: str) -> MindsDBPrepareResult:
             details={"datasource": ds},
         )
 
-    transformed = transform_sql_for_mindsdb(s, ds)
-    changed = transformed.strip() != s.strip()
+    # Convert MySQL-style SQL to PostgreSQL-compatible and wrap in passthrough form.
+    # This ensures:
+    # 1. Backtick-quoted identifiers become double-quoted (case preserved in PostgreSQL)
+    # 2. Backtick-quoted function names are unquoted (PostgreSQL is case-insensitive)
+    # 3. Datasource prefix is removed (passthrough sends directly to the datasource)
+    pg_sql = _mysql_to_postgres_sql(s, ds)
+    wrapped = _wrap_as_passthrough(pg_sql, ds)
     return MindsDBPrepareResult(
-        sql=transformed,
-        changed=bool(changed),
-        reason="transform_sql_for_mindsdb" if changed else "no_change",
+        sql=wrapped,
+        changed=True,
+        reason="wrapped_as_passthrough",
         details={"datasource": ds},
     )
 
