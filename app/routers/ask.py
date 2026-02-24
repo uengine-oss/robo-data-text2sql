@@ -3,6 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
 import time
+import re
 
 from app.config import settings
 from app.deps import get_neo4j_session, get_db_connection
@@ -58,6 +59,39 @@ class AskResponse(BaseModel):
     warnings: Optional[List[str]] = None
 
 
+def _normalize_row_limit(limit: Optional[int]) -> int:
+    default_limit = 1000
+    max_rows = int(getattr(settings, "sql_max_rows", default_limit) or default_limit)
+    safe_cap = max(1, max_rows)
+    if limit is None:
+        return min(default_limit, safe_cap)
+    try:
+        n = int(limit)
+    except (TypeError, ValueError):
+        n = default_limit
+    if n <= 0:
+        return min(default_limit, safe_cap)
+    return min(n, safe_cap)
+
+
+def _has_explicit_row_limit(sql: str) -> bool:
+    s = (sql or "").strip().rstrip(";").strip()
+    if not s:
+        return False
+    if re.search(r"(?is)\blimit\s+\d+(\s+offset\s+\d+)?\s*$", s):
+        return True
+    if re.search(r"(?is)\bfetch\s+first\s+\d+\s+rows?\s+only\s*$", s):
+        return True
+    return False
+
+
+def _ensure_row_limit(sql: str, row_limit: int) -> str:
+    s = (sql or "").strip().rstrip(";").strip()
+    if not s or _has_explicit_row_limit(s):
+        return s
+    return f"{s} LIMIT {int(row_limit)}"
+
+
 @router.post("", response_model=AskResponse)
 async def ask_question(
     request: AskRequest,
@@ -69,6 +103,7 @@ async def ask_question(
     """
     warnings = []
     total_start = time.time()
+    row_limit = _normalize_row_limit(request.limit)
     
     generated_sql: Optional[str] = None
     validated_sql: Optional[str] = None
@@ -104,7 +139,8 @@ async def ask_question(
         generated_sql = await sql_chain.generate_sql(
             question=request.question,
             schema_text=schema_text,
-            join_hints=join_hints
+            join_hints=join_hints,
+            row_limit=row_limit,
         )
         llm_ms = (time.time() - llm_start) * 1000
         
@@ -114,6 +150,7 @@ async def ask_question(
         
         try:
             validated_sql, _ = sql_guard.validate(generated_sql, allowed_tables=allowed_tables)
+            validated_sql = _ensure_row_limit(validated_sql, row_limit)
         except SQLValidationError as e:
             # Include generated SQL in error response
             raise HTTPException(

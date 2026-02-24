@@ -12,6 +12,9 @@ SQL_GENERATION_TEMPLATE = """You are a senior database engineer. Your task is to
 User Question:
 {question}
 
+Requested Row Limit:
+{row_limit}
+
 Available Schema:
 {schema_text}
 
@@ -23,7 +26,7 @@ Constraints and Rules:
 5. Follow the suggested joins if tables need to be joined
 6. Do NOT use CTEs (WITH clauses) unless absolutely necessary
 7. Do NOT add SQL comments (-- or /* */)
-8. The query will automatically have a LIMIT applied, don't worry about it
+8. Include an explicit LIMIT {row_limit} unless a stricter smaller limit is already required
 9. Use appropriate WHERE clauses to filter data efficiently
 10. Prefer simple queries over complex nested subqueries
 11. Return properly formatted column aliases for clarity
@@ -61,13 +64,15 @@ class SQLChain:
         self,
         question: str,
         schema_text: str,
-        join_hints: str = ""
+        join_hints: str = "",
+        row_limit: int = 1000,
     ) -> str:
         """Generate SQL from natural language question"""
         result = await self.chain.ainvoke({
             "question": question,
             "schema_text": schema_text,
-            "join_hints": join_hints or "No specific join hints."
+            "join_hints": join_hints or "No specific join hints.",
+            "row_limit": int(max(1, row_limit)),
         })
         
         # Clean up the result
