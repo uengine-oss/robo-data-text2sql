@@ -674,24 +674,57 @@ async def create_materialized_view(
         )
 
     # 2) Create view (drop + create)
-    view_ident = f"`{request.datasource}`.`{request.schema_name}`.`{request.view_name}`"
-    try:
-        await executor.execute_ddl(
-            db_conn,
-            f"DROP VIEW IF EXISTS {view_ident}",
-            timeout=float(settings.sql_timeout_seconds),
+    # Some MindsDB deployments reject 3-part identifiers for VIEW names.
+    # Try 3-part first for backward compatibility, then fall back to 2-part.
+    candidate_view_idents: List[tuple[str, str]] = []
+    candidate_view_idents.append(
+        (
+            f"`{request.datasource}`.`{request.schema_name}`.`{request.view_name}`",
+            f"{request.datasource}.{request.schema_name}.{request.view_name}",
         )
-        await executor.execute_ddl(
-            db_conn,
-            f"CREATE VIEW {view_ident} AS {validated_source}",
-            timeout=float(settings.sql_timeout_seconds),
+    )
+    candidate_view_idents.append(
+        (
+            f"`{request.datasource}`.`{request.view_name}`",
+            f"{request.datasource}.{request.view_name}",
         )
-    except Exception as exc:
+    )
+    # Deduplicate while preserving order
+    seen_idents = set()
+    deduped_candidates: List[tuple[str, str]] = []
+    for ident, full_name in candidate_view_idents:
+        if ident in seen_idents:
+            continue
+        seen_idents.add(ident)
+        deduped_candidates.append((ident, full_name))
+
+    created_ident = ""
+    created_full_name = ""
+    create_errors: List[str] = []
+    for view_ident, full_name in deduped_candidates:
+        try:
+            await executor.execute_ddl(
+                db_conn,
+                f"DROP VIEW IF EXISTS {view_ident}",
+                timeout=float(settings.sql_timeout_seconds),
+            )
+            await executor.execute_ddl(
+                db_conn,
+                f"CREATE VIEW {view_ident} AS {validated_source}",
+                timeout=float(settings.sql_timeout_seconds),
+            )
+            created_ident = view_ident
+            created_full_name = full_name
+            break
+        except Exception as exc:
+            create_errors.append(f"{full_name}: {exc}")
+
+    if not created_ident:
         return MaterializedViewResponse(
             status="error",
             view_name=request.view_name,
             full_name=f"{request.datasource}.{request.schema_name}.{request.view_name}",
-            error_message=f"View 생성 실패: {exc}",
+            error_message="View 생성 실패: " + " | ".join(create_errors),
         )
 
     # 3) Best-effort row count
@@ -700,7 +733,7 @@ async def create_materialized_view(
         try:
             res = await executor.execute_query(
                 db_conn,
-                f"SELECT COUNT(*) AS cnt FROM {view_ident}",
+                f"SELECT COUNT(*) AS cnt FROM {created_ident}",
                 timeout=float(settings.sql_timeout_seconds),
             )
             rows = res.get("rows") or []
@@ -712,7 +745,7 @@ async def create_materialized_view(
     return MaterializedViewResponse(
         status="success",
         view_name=request.view_name,
-        full_name=f"{request.datasource}.{request.schema_name}.{request.view_name}",
+        full_name=created_full_name or f"{request.datasource}.{request.schema_name}.{request.view_name}",
         row_count=row_count,
         message=f"View '{request.view_name}' 생성 완료 ({row_count}개 행)",
     )
