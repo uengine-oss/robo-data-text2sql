@@ -42,7 +42,9 @@ async def run_startup_sanity_checks_or_raise() -> List[SanityCheckResult]:
                 )
             )
 
-    failed = [r for r in results if not r.ok]
+    # target_db와 google은 non-fatal (로컬 개발 환경에서 필수가 아님)
+    non_fatal = {"target_db", "google"}
+    failed = [r for r in results if not r.ok and r.name not in non_fatal]
 
     for r in results:
         SmartLogger.log(
