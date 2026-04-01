@@ -298,7 +298,7 @@ async def _neo4j_fetch_fk_neighbors_1hop(
         return []
     cypher = """
     UNWIND $seed_fqns AS seed
-    MATCH (t1:Table)-[:HAS_COLUMN]->(c1:Column)-[:FK_TO]->(c2:Column)<-[:HAS_COLUMN]-(t2:Table)
+    MATCH (t1:Table)-[:HAS_COLUMN]->(c1:Column)-[:FK_TO_COLUMN]->(c2:Column)<-[:HAS_COLUMN]-(t2:Table)
     WITH t2,
          (toLower(COALESCE(t1.schema,'')) + '.' + toLower(COALESCE(t1.name,''))) AS fqn1
     WHERE fqn1 = seed
@@ -862,7 +862,7 @@ async def _neo4j_fetch_fk_relationships(
     # but Table.original_name may preserve original casing).
     table_fqns_l = [str(x or "").strip().lower() for x in (table_fqns or []) if str(x or "").strip()]
     cypher = """
-    MATCH (t1:Table)-[:HAS_COLUMN]->(c1:Column)-[fk:FK_TO]->(c2:Column)<-[:HAS_COLUMN]-(t2:Table)
+    MATCH (t1:Table)-[:HAS_COLUMN]->(c1:Column)-[fk:FK_TO_COLUMN]->(c2:Column)<-[:HAS_COLUMN]-(t2:Table)
     WITH t1, c1, fk, c2, t2,
          (toLower(COALESCE(t1.schema,'')) + '.' + toLower(COALESCE(t1.original_name, t1.name))) AS fqn1,
          (toLower(COALESCE(t2.schema,'')) + '.' + toLower(COALESCE(t2.original_name, t2.name))) AS fqn2

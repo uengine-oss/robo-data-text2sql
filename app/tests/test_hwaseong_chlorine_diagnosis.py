@@ -156,7 +156,7 @@ _neo4j_search_tables_text2sql_vector() 함수:
 
         # Check FK relationship
         result = await session.run("""
-            MATCH (t1:Table {schema: 'hwaseong'})-[:HAS_COLUMN]->(c1:Column)-[fk:FK_TO]->(c2:Column)<-[:HAS_COLUMN]-(t2:Table {schema: 'hwaseong'})
+            MATCH (t1:Table {schema: 'hwaseong'})-[:HAS_COLUMN]->(c1:Column)-[fk:FK_TO_COLUMN]->(c2:Column)<-[:HAS_COLUMN]-(t2:Table {schema: 'hwaseong'})
             RETURN t1.name AS from_table, c1.name AS from_col,
                    t2.name AS to_table, c2.name AS to_col,
                    fk.constraint AS constraint

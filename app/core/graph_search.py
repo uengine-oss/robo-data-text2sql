@@ -230,7 +230,7 @@ class GraphSearcher:
     async def get_fk_details(self, table_keys: List[Dict[str, str]]) -> List[Dict[str, Any]]:
         """Get detailed foreign key constraints between tables"""
         query = """
-        MATCH (t1:Table)-[:HAS_COLUMN]->(c1:Column)-[fk:FK_TO]->(c2:Column)<-[:HAS_COLUMN]-(t2:Table)
+        MATCH (t1:Table)-[:HAS_COLUMN]->(c1:Column)-[fk:FK_TO_COLUMN]->(c2:Column)<-[:HAS_COLUMN]-(t2:Table)
         WHERE (t1.db + '|' + t1.schema + '|' + t1.name) IN $keys
           AND (t2.db + '|' + t2.schema + '|' + t2.name) IN $keys
         RETURN (t1.schema + '.' + t1.name) AS from_table,

@@ -4,12 +4,12 @@ from neo4j import AsyncSession
 
 
 RELATIONSHIP_RANKS = {
-    "HAS_COLUMN → FK_TO → HAS_COLUMN": 100,
+    "HAS_COLUMN → FK_TO_COLUMN → HAS_COLUMN": 100,
 }
 DEFAULT_RELATIONSHIP_SCORE = 1
 
 RELATIONSHIP_TYPE_MAP = {
-    "HAS_COLUMN → FK_TO → HAS_COLUMN": "외래키 관계",
+    "HAS_COLUMN → FK_TO_COLUMN → HAS_COLUMN": "외래키 관계",
 }
 
 
@@ -60,7 +60,7 @@ async def get_table_fk_relationships(
       OR (t.original_name IS NOT NULL AND toLower(t.original_name) = toLower($table_name))
     )
       AND ($schema IS NULL OR (t.schema IS NOT NULL AND toLower(t.schema) = toLower($schema)))
-    MATCH (t)-[:HAS_COLUMN]->(c1:Column)-[fk:FK_TO]->(c2:Column)<-[:HAS_COLUMN]-(t2:Table)
+    MATCH (t)-[:HAS_COLUMN]->(c1:Column)-[fk:FK_TO_COLUMN]->(c2:Column)<-[:HAS_COLUMN]-(t2:Table)
     RETURN DISTINCT COALESCE(t2.original_name, t2.name) AS related_table,
            t2.schema AS related_table_schema,
            t2.description AS related_table_description,
@@ -103,7 +103,7 @@ async def get_table_fk_relationships(
           OR (t.original_name IS NOT NULL AND toLower(t.original_name) = toLower($table_name))
         )
           AND ($schema IS NULL OR (t.schema IS NOT NULL AND toLower(t.schema) = toLower($schema)))
-        MATCH (t2:Table)-[:HAS_COLUMN]->(c2:Column)-[fk:FK_TO]->(c1:Column)<-[:HAS_COLUMN]-(t)
+        MATCH (t2:Table)-[:HAS_COLUMN]->(c2:Column)-[fk:FK_TO_COLUMN]->(c1:Column)<-[:HAS_COLUMN]-(t)
         RETURN DISTINCT COALESCE(t2.original_name, t2.name) AS related_table,
                t2.schema AS related_table_schema,
                t2.description AS related_table_description,
@@ -300,7 +300,7 @@ async def get_column_fk_relationships(
       OR (t.original_name IS NOT NULL AND toLower(t.original_name) = toLower($table_name))
     )
       AND ($schema IS NULL OR (t.schema IS NOT NULL AND toLower(t.schema) = toLower($schema)))
-    MATCH (t)-[:HAS_COLUMN]->(c1:Column {name: $column_name})-[fk:FK_TO]->(c2:Column)<-[:HAS_COLUMN]-(t2:Table)
+    MATCH (t)-[:HAS_COLUMN]->(c1:Column {name: $column_name})-[fk:FK_TO_COLUMN]->(c2:Column)<-[:HAS_COLUMN]-(t2:Table)
     RETURN COALESCE(t2.original_name, t2.name) AS referenced_table,
            t2.schema AS referenced_table_schema,
            t2.description AS referenced_table_description,
