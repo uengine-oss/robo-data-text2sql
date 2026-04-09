@@ -1,11 +1,21 @@
 """FastAPI main application"""
 from pathlib import Path
-from dotenv import load_dotenv, find_dotenv
+from dotenv import load_dotenv
 
-_env_path = Path(__file__).resolve().parents[1] / ".env"
-if not _env_path.exists():
-    _env_path = find_dotenv(usecwd=True)
-load_dotenv(dotenv_path=_env_path)
+
+def _load_env_chain() -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    repo_root = project_root.parent
+    root_env = repo_root / ".env"
+    project_env = project_root / ".env"
+
+    if root_env.exists():
+        load_dotenv(dotenv_path=root_env, override=False)
+    if project_env.exists():
+        load_dotenv(dotenv_path=project_env, override=True)
+
+
+_load_env_chain()
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
