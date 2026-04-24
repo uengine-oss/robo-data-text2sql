@@ -16,6 +16,7 @@ NOTE:
 from __future__ import annotations
 
 import inspect
+import os
 from functools import lru_cache
 from dataclasses import dataclass
 from typing import Any, Dict, Literal, Optional, Union
@@ -118,13 +119,52 @@ def _get_openai_async_client() -> AsyncOpenAI:
     return AsyncOpenAI(api_key=api_key)
 
 
+def _require_embedding_api_key(*, provider: str) -> str:
+    key = (getattr(settings, "embedding_api_key", "") or "").strip()
+    if provider == "openai_compatible" and not key:
+        key = (os.getenv("OPENROUTER_API_KEY", "") or "").strip()
+    if not key:
+        key = (getattr(settings, "openai_api_key", "") or "").strip()
+    if not key or key.lower() == "dummy":
+        missing_name = (
+            "EMBEDDING_API_KEY/OPENROUTER_API_KEY"
+            if provider == "openai_compatible"
+            else "OPENAI_API_KEY"
+        )
+        raise ValueError(f"{missing_name} is missing (embedding_provider={provider})")
+    return key
+
+
+def _get_embedding_base_url(*, provider: str) -> str:
+    if provider == "openai":
+        return ""
+    base_url = (getattr(settings, "embedding_provider_url", "") or "").strip()
+    if not base_url:
+        raise ValueError(
+            "EMBEDDING_PROVIDER_URL is required when embedding_provider=openai_compatible"
+        )
+    return base_url
+
+
+@lru_cache(maxsize=8)
+def _get_embedding_async_client(*, provider: str, api_key: str, base_url: str) -> AsyncOpenAI:
+    kwargs: Dict[str, Any] = {"api_key": api_key}
+    if base_url:
+        kwargs["base_url"] = base_url
+    return AsyncOpenAI(**kwargs)
+
+
 def create_embedding_client() -> EmbeddingClient:
     provider = (getattr(settings, "embedding_provider", "") or "").strip().lower()
-    if provider != "openai":
+    if provider not in {"openai", "openai_compatible"}:
         raise NotImplementedError(
-            f"embedding_provider={provider!r} is not supported yet (only 'openai' is supported)."
+            "embedding_provider={!r} is not supported yet (allowed: 'openai', "
+            "'openai_compatible').".format(provider)
         )
-    return EmbeddingClient(_get_openai_async_client())
+    api_key = _require_embedding_api_key(provider=provider)
+    base_url = _get_embedding_base_url(provider=provider)
+    client = _get_embedding_async_client(provider=provider, api_key=api_key, base_url=base_url)
+    return EmbeddingClient(client)
 
 
 @dataclass(frozen=True)

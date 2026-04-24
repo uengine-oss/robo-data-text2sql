@@ -50,7 +50,7 @@ class Settings(BaseSettings):
     llm_model: str = "gemini-3-flash-preview"
 
     light_llm_provider: Literal["openai", "google", "openai_compatible"] = "google"
-    light_llm_model: str = "gemini-2.5-flash-lite-preview-09-2025"
+    light_llm_model: str = "gemini-3.1-flash-lite-preview"
 
     # OpenAI-compatible base URLs (used when provider is openai/openai_compatible)
     # Example: http://localhost:11434/v1 (Ollama), https://<gateway>/v1, etc.
@@ -61,8 +61,12 @@ class Settings(BaseSettings):
     llm_cache_path: str = ".cache/llm_cache.db"
 
     # Unified Embedding configuration
-    embedding_provider: str = "openai"
+    # - "openai": OpenAI official endpoint
+    # - "openai_compatible": OpenAI-compatible embeddings endpoint (OpenRouter, gateway, etc.)
+    embedding_provider: Literal["openai", "openai_compatible"] = "openai"
     embedding_model: str = "text-embedding-3-small"
+    embedding_provider_url: str = ""
+    embedding_api_key: str = ""
 
     # API keys (optional at settings-load time; validated at runtime by factories)
     openai_api_key: str = ""

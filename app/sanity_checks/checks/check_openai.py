@@ -25,11 +25,13 @@ async def check_openai(*, timeout_seconds: float = 20.0) -> SanityCheckResult:
     OpenAI connectivity check (fail-fast only when OpenAI is required).
 
     Runs when:
-    - embedding_provider == "openai" (embeddings check)
+    - embedding_provider in {"openai", "openai_compatible"} (embeddings check)
     - llm_provider in {"openai", "openai_compatible"} (LLM check via core factory)
 
     Notes:
     - When embedding_provider=="openai", this uses OPENAI_API_KEY against the official OpenAI endpoint.
+    - When embedding_provider=="openai_compatible", this uses EMBEDDING_API_KEY/OPENROUTER_API_KEY
+      against settings.embedding_provider_url.
     - When llm_provider=="openai_compatible", this uses OPENAI_COMPATIBLE_API_KEY (or falls back to
       OPENAI_API_KEY) against settings.llm_provider_url.
     """
@@ -37,7 +39,9 @@ async def check_openai(*, timeout_seconds: float = 20.0) -> SanityCheckResult:
 
     embedding_provider = (getattr(settings, "embedding_provider", "") or "").strip().lower()
     llm_provider = _norm_llm_provider(getattr(settings, "llm_provider", "") or "")
-    needs_openai = (embedding_provider == "openai") or (llm_provider in {"openai", "openai_compatible"})
+    needs_openai = (
+        embedding_provider in {"openai", "openai_compatible"}
+    ) or (llm_provider in {"openai", "openai_compatible"})
     if not needs_openai:
         return SanityCheckResult(
             name=name,
@@ -53,11 +57,8 @@ async def check_openai(*, timeout_seconds: float = 20.0) -> SanityCheckResult:
             "llm_provider": llm_provider,
         }
 
-        if embedding_provider == "openai":
+        if embedding_provider in {"openai", "openai_compatible"}:
             try:
-                key = (getattr(settings, "openai_api_key", "") or "").strip()
-                if (not key) or key.lower() == "dummy":
-                    raise RuntimeError("OPENAI_API_KEY is missing but embedding_provider=openai")
                 embedder = create_embedding_client()
                 vec = await embedder.embed_text("startup-sanity")
                 dim = len(vec)
@@ -66,6 +67,11 @@ async def check_openai(*, timeout_seconds: float = 20.0) -> SanityCheckResult:
                     raise RuntimeError(f"Embedding dimension mismatch: expected={expected_dim} actual={dim}")
                 data.update(
                     {
+                        "embedding_provider_url": (
+                            (getattr(settings, "embedding_provider_url", "") or "").strip() or None
+                            if embedding_provider == "openai_compatible"
+                            else None
+                        ),
                         "embedding_model": settings.embedding_model,
                         "embedding_dim": dim,
                         "embedding_check": "ok",
@@ -150,7 +156,16 @@ async def check_openai(*, timeout_seconds: float = 20.0) -> SanityCheckResult:
             data={
                 "stage": stage,
                 "embedding_provider": embedding_provider,
-                "embedding_model": (settings.embedding_model if embedding_provider == "openai" else None),
+                "embedding_model": (
+                    settings.embedding_model
+                    if embedding_provider in {"openai", "openai_compatible"}
+                    else None
+                ),
+                "embedding_provider_url": (
+                    (getattr(settings, "embedding_provider_url", "") or "").strip() or None
+                    if embedding_provider == "openai_compatible"
+                    else None
+                ),
                 "llm_provider": llm_provider,
                 "llm_model": (settings.llm_model if llm_provider in {"openai", "openai_compatible"} else None),
                 "llm_provider_url": (
