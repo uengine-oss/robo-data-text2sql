@@ -127,6 +127,9 @@ class ControllerSqlCandidatesGenerator:
         *,
         question: str,
         dbms: str,
+        generation_mode: Optional[str] = None,
+        inner_dbms: Optional[str] = None,
+        datasource: Optional[str] = None,
         max_sql_seconds: int,
         context_xml: str,
         conversation_context: Optional[Dict[str, Any]] = None,
@@ -151,6 +154,12 @@ class ControllerSqlCandidatesGenerator:
             "context_xml": str(context_xml or ""),
             "temperature": float(t),
         }
+        if generation_mode:
+            payload["generation_mode"] = str(generation_mode)
+        if inner_dbms:
+            payload["inner_dbms"] = str(inner_dbms)
+        if datasource:
+            payload["datasource"] = str(datasource)
         if isinstance(conversation_context, dict) and conversation_context:
             # Keep payload bounded (avoid sending huge data by accident)
             # The caller should already cap/trim; we add a shallow safeguard here.

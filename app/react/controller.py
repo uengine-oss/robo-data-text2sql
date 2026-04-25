@@ -8,6 +8,12 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from app.core.sql_mindsdb_prepare import (
+    extract_passthrough_inner_sql,
+    infer_passthrough_inner_dialect,
+    is_passthrough_query,
+    wrap_inner_sql_as_passthrough,
+)
 from app.react.generators.controller_repair_generator import get_controller_repair_generator
 from app.react.generators.controller_sql_candidates_generator import (
     get_controller_sql_candidates_generator,
@@ -831,6 +837,9 @@ async def draft_llm_candidates(
     *,
     question: str,
     dbms: str,
+    generation_mode: Optional[str] = None,
+    inner_dbms: Optional[str] = None,
+    datasource: Optional[str] = None,
     max_sql_seconds: int,
     compact_context: str,
     conversation_context: Optional[Dict[str, Any]] = None,
@@ -843,6 +852,9 @@ async def draft_llm_candidates(
     cands, _mode = await gen.generate(
         question=question,
         dbms=dbms,
+        generation_mode=generation_mode,
+        inner_dbms=inner_dbms,
+        datasource=datasource,
         max_sql_seconds=max_sql_seconds,
         context_xml=compact_context,
         conversation_context=conversation_context,
@@ -1296,6 +1308,27 @@ async def run_controller(
             return (False, "")
         return (bool(hard_reject), str(hard_reason or ""))
 
+    datasource = str(getattr(tool_context, "datasource", "") or "").strip()
+    inner_dbms = infer_passthrough_inner_dialect(datasource)
+    generation_mode = "passthrough_inner_only" if inner_dbms else ""
+
+    def _sql_for_validation(sql: str) -> str:
+        s = sanitize_sql(sql)
+        if not s or not generation_mode or not datasource:
+            return s
+        if is_passthrough_query(s, datasource):
+            return s
+        return wrap_inner_sql_as_passthrough(s, datasource)
+
+    def _sql_for_controller_state(sql: str, fallback_sql: str = "") -> str:
+        s = sanitize_sql(sql)
+        if not s or not generation_mode or not datasource:
+            return s
+        inner = extract_passthrough_inner_sql(s, datasource)
+        if inner:
+            return sanitize_sql(inner)
+        return sanitize_sql(fallback_sql) or s
+
     async def _evaluate_once(
         *,
         sql_in: str,
@@ -1304,10 +1337,11 @@ async def run_controller(
         base_candidate: int,
         repair_round: int,
     ) -> Tuple[ControllerAttempt, float, bool, List[str], List[str], List[Dict[str, Any]], List[str]]:
-        tool_result = await execute_tool("validate_sql", tool_context, {"sql": sql_in})
+        validation_sql = _sql_for_validation(sql_in)
+        tool_result = await execute_tool("validate_sql", tool_context, {"sql": validation_sql})
         parsed = parse_validate_sql(tool_result)
         verdict = str(parsed.get("verdict") or "").strip().upper()
-        selected_sql = sanitize_sql(str(parsed.get("selected_sql") or "") or sql_in)
+        selected_sql = _sql_for_controller_state(str(parsed.get("selected_sql") or "") or validation_sql, sql_in)
         preview = parsed.get("preview") if isinstance(parsed.get("preview"), dict) else {}
         suggested_fixes = parsed.get("suggested_fixes") if isinstance(parsed.get("suggested_fixes"), list) else []
         auto_rewrite = parsed.get("auto_rewrite") if isinstance(parsed.get("auto_rewrite"), dict) else {}
@@ -1443,6 +1477,9 @@ async def run_controller(
     candidates_raw = await draft_llm_candidates(
         question=question,
         dbms=dbms,
+        generation_mode=generation_mode or None,
+        inner_dbms=inner_dbms or None,
+        datasource=datasource or None,
         max_sql_seconds=max_sql_seconds,
         compact_context=compact_ctx,
         conversation_context=conversation_context,
@@ -1680,6 +1717,9 @@ async def run_controller(
         gen = get_controller_repair_generator()
         revised_raw, _mode = await gen.generate(
             question=question,
+            generation_mode=generation_mode or None,
+            inner_dbms=inner_dbms or None,
+            datasource=datasource or None,
             missing_requirements=legacy_missing,
             failed_checks=list(active_failed_payload or [])[:48],
             passed_must_ids=list(active_passed_must_ids or [])[:48],

@@ -29,6 +29,18 @@ Input (JSON):
 - suggested_fixes: optional hints from validate_sql (if any)
 - auto_rewrite: optional details about validate_sql rewrites (if any)
 - missing_requirements_legacy: fallback string hints (may exist for backward compatibility)
+- generation_mode: OPTIONAL. If "passthrough_inner_only", repair ONLY the datasource inner SQL.
+- inner_dbms: OPTIONAL. Database dialect for inner SQL when generation_mode is "passthrough_inner_only".
+- datasource: OPTIONAL. MindsDB datasource name. This is execution metadata.
+
+Passthrough inner-only mode:
+- If generation_mode == "passthrough_inner_only", NEVER output the outer MindsDB wrapper.
+  - Do NOT output: SELECT * FROM `datasource` ( ... )
+  - Output ONLY the repaired SQL that belongs inside the parentheses.
+- In that mode, use exactly inner_dbms as the SQL dialect.
+  - If inner_dbms is postgresql: use PostgreSQL syntax and double-quoted identifiers such as "RWIS"."RDITAG_TB" and alias."TAGSN".
+  - If inner_dbms is mysql/mariadb: use MySQL syntax for the inner SQL.
+- For PostgreSQL inner SQL, NEVER use MySQL-only functions such as DATE_FORMAT, STR_TO_DATE, DATE_SUB, CURDATE, or IFNULL.
 
 Output JSON schema (no extra keys):
 { "sql": "SELECT ..." }

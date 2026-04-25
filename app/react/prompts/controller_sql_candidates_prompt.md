@@ -30,8 +30,21 @@ Input (JSON):
 -   - Use it ONLY to preserve/adjust intent across follow-ups (e.g., "방금 결과", "그 7일", "전일 대비").
 -   - CRITICAL: Do NOT invent tables/columns from conversation_context. You must still use ONLY tables/columns present in context_xml.
 - temperature: sampling temperature (FYI; may be provided by caller)
+- generation_mode: OPTIONAL. If "passthrough_inner_only", generate ONLY the inner SQL for the datasource.
+- inner_dbms: OPTIONAL. Database dialect for inner SQL when generation_mode is "passthrough_inner_only".
+- datasource: OPTIONAL. MindsDB datasource name. This is execution metadata, not a table/schema name to invent.
 - diversity_hints: optional list of short strategy hints to force candidate diversity
 - seed: optional integer seed hint (not guaranteed)
+
+Passthrough inner-only mode:
+- If generation_mode == "passthrough_inner_only", NEVER output the outer MindsDB wrapper.
+  - Do NOT output: SELECT * FROM `datasource` ( ... )
+  - Output ONLY the SQL that belongs inside the parentheses.
+- In that mode, use exactly inner_dbms as the SQL dialect.
+  - If inner_dbms is postgresql: use PostgreSQL syntax and double-quoted identifiers such as "RWIS"."RDITAG_TB" and alias."TAGSN".
+  - If inner_dbms is mysql/mariadb: use MySQL syntax for the inner SQL.
+- For PostgreSQL inner SQL, NEVER use MySQL-only functions such as DATE_FORMAT, STR_TO_DATE, DATE_SUB, CURDATE, or IFNULL.
+- The system will wrap the returned inner SQL statically for MindsDB execution.
 
 Diversity rules:
 - The candidates MUST be meaningfully different in SQL structure. Do NOT create near-duplicates that only change:

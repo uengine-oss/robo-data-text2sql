@@ -103,6 +103,9 @@ class ControllerRepairGenerator:
         self,
         *,
         question: str,
+        generation_mode: Optional[str] = None,
+        inner_dbms: Optional[str] = None,
+        datasource: Optional[str] = None,
         # Backward compatible: legacy string hints
         missing_requirements: Optional[List[str]] = None,
         # Preferred: structured rubric feedback + validate_sql hints
@@ -137,6 +140,12 @@ class ControllerRepairGenerator:
             "missing_requirements_legacy": miss[:24],
             "temperature": float(t),
         }
+        if generation_mode:
+            payload["generation_mode"] = str(generation_mode)
+        if inner_dbms:
+            payload["inner_dbms"] = str(inner_dbms)
+        if datasource:
+            payload["datasource"] = str(datasource)
         if isinstance(conversation_context, dict) and conversation_context:
             payload["conversation_context"] = conversation_context
         human_text = json.dumps(payload, ensure_ascii=False)

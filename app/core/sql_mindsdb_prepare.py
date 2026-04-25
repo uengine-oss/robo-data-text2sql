@@ -49,6 +49,23 @@ def is_passthrough_query(sql: str, datasource: str) -> bool:
     return re.search(pat, s) is not None
 
 
+def infer_passthrough_inner_dialect(datasource: str) -> str:
+    """
+    Best-effort datasource dialect inference for MindsDB passthrough inner SQL.
+
+    This keeps the first implementation conservative: only well-known datasource
+    names opt in. Unknown datasources keep the legacy behavior.
+    """
+    ds = (datasource or "").strip().lower()
+    if not ds:
+        return ""
+    if "postgres" in ds or ds in {"pg"}:
+        return "postgresql"
+    if "mysql" in ds or "mariadb" in ds:
+        return "mysql"
+    return ""
+
+
 def _find_matching_paren_span(text: str, open_idx: int) -> Optional[Tuple[int, int]]:
     """
     Return (start_idx, end_idx) for the parenthesized span including parentheses.
@@ -202,6 +219,18 @@ def _wrap_as_passthrough(inner_sql: str, datasource: str) -> str:
     return f"SELECT * FROM `{ds}` (\n{inner}\n)"
 
 
+def wrap_inner_sql_as_passthrough(inner_sql: str, datasource: str) -> str:
+    return _wrap_as_passthrough(inner_sql, datasource)
+
+
+def extract_passthrough_inner_sql(sql: str, datasource: str) -> Optional[str]:
+    info = _extract_passthrough_inner(sql, datasource)
+    if not info:
+        return None
+    inner = str(info.get("inner") or "").strip()
+    return inner or None
+
+
 def prepare_sql_for_mindsdb(sql: str, datasource: str) -> MindsDBPrepareResult:
     """
     Deterministically prepare SQL for execution via MindsDB MySQL endpoint.
@@ -248,7 +277,10 @@ def prepare_sql_for_mindsdb(sql: str, datasource: str) -> MindsDBPrepareResult:
 
 __all__ = [
     "MindsDBPrepareResult",
+    "extract_passthrough_inner_sql",
+    "infer_passthrough_inner_dialect",
     "is_passthrough_query",
     "fix_passthrough_query_if_needed",
     "prepare_sql_for_mindsdb",
+    "wrap_inner_sql_as_passthrough",
 ]
