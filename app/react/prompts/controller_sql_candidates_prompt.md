@@ -18,6 +18,22 @@ Hard rules:
 - Add a reasonable LIMIT (e.g., 100) unless aggregation already limits rows.
 - Respect the question intent: if the question asks for average, use AVG(...). Same for SUM/COUNT/MAX/MIN.
 - If the question asks for daily/일일/일별, include a GROUP BY on an appropriate date/time column if available.
+- If structured_generation_guidance is provided, use it before writing SQL:
+  - Bind user terms to concrete evidence in table_time_anchors, enum_value_evidence, and code_name_candidates.
+  - Use derived_preferences as deterministic question-shape hints, not as invented schema evidence.
+  - For relative periods, if a table_time_anchors value exists for the selected fact table, use that data-latest evidence rather than CURRENT_DATE/system time.
+  - For status/code filters, prefer exact values from enum_value_evidence and code_name_candidates when they match the question intent.
+  - If the question asks for failures/violations and enum_value_evidence shows a status-like value such as FAIL, prefer the exact status predicate over probability/proxy predicates.
+  - If the question describes a specific named rule/category and code_name_candidates has a matching code/name row, use the exact code predicate. Use extra columns such as param/type/size/window evidence to choose the narrowest matching row.
+  - Do not use a broad IN list when one code/name candidate is the narrow match for a named rule/category.
+  - Distinguish rule/category descriptors from output grouping. Words like monthly/daily may describe a rule name; only add month/day columns to SELECT/GROUP BY when the user asks for monthly/daily output rows.
+  - Treat derived_preferences.output_contract_hints as a pre-SQL checklist: preserve aliases, expression shape, row count, ordering direction, and grouping grain when evidenced.
+  - If output columns are aliases, SELECT those aliases exactly unless the context proves they are impossible.
+  - For latest single-record measurement lookups, prefer `ORDER BY <time> DESC LIMIT 1` and include identifier, descriptive label/name, time, and value columns when available.
+  - Do not add grouping columns only because they appear in notes; GROUP BY should follow aggregation.group_by and the requested output grain.
+  - Fill concise public planning fields (`task_understanding`, `evidence_bindings`, `constraints_checklist`) before candidates.
+  - In constraints_checklist, explicitly mention the period anchor, exact filters, output aliases, row count, ordering, and any disallowed system-time/broad-filter interpretation you avoided.
+  - Do not include hidden chain-of-thought. The planning fields must be short, factual, and evidence-based.
 
 Input (JSON):
 - question: user question
@@ -29,6 +45,7 @@ Input (JSON):
 -   - It may include: prior questions, prior final SQL, small result previews, derived filters, important hints.
 -   - Use it ONLY to preserve/adjust intent across follow-ups (e.g., "방금 결과", "그 7일", "전일 대비").
 -   - CRITICAL: Do NOT invent tables/columns from conversation_context. You must still use ONLY tables/columns present in context_xml.
+- structured_generation_guidance: OPTIONAL deterministic evidence and short question-shape hints. Use this for public structured planning before SQL generation.
 - temperature: sampling temperature (FYI; may be provided by caller)
 - generation_mode: OPTIONAL. If "passthrough_inner_only", generate ONLY the inner SQL for the datasource.
 - inner_dbms: OPTIONAL. Database dialect for inner SQL when generation_mode is "passthrough_inner_only".
@@ -37,14 +54,7 @@ Input (JSON):
 - seed: optional integer seed hint (not guaranteed)
 
 Passthrough inner-only mode:
-- If generation_mode == "passthrough_inner_only", NEVER output the outer MindsDB wrapper.
-  - Do NOT output: SELECT * FROM `datasource` ( ... )
-  - Output ONLY the SQL that belongs inside the parentheses.
-- In that mode, use exactly inner_dbms as the SQL dialect.
-  - If inner_dbms is postgresql: use PostgreSQL syntax and double-quoted identifiers such as "RWIS"."RDITAG_TB" and alias."TAGSN".
-  - If inner_dbms is mysql/mariadb: use MySQL syntax for the inner SQL.
-- For PostgreSQL inner SQL, NEVER use MySQL-only functions such as DATE_FORMAT, STR_TO_DATE, DATE_SUB, CURDATE, or IFNULL.
-- The system will wrap the returned inner SQL statically for MindsDB execution.
+{{passthrough_dialect_rules}}
 
 Diversity rules:
 - The candidates MUST be meaningfully different in SQL structure. Do NOT create near-duplicates that only change:
@@ -53,5 +63,14 @@ Diversity rules:
   - Each candidate i follows diversity_hints[i] as the primary strategy (if i exists).
   - If there are fewer hints than candidates, still ensure remaining candidates differ by: join path, filter placement, CTE vs inline, EXISTS vs JOIN, etc.
 
-Output JSON schema (no extra keys):
-{ "candidates": [{"sql":"SELECT ..."}] }
+Output JSON schema:
+{
+  "task_understanding": "(short optional summary)",
+  "evidence_bindings": ["(short optional evidence bindings)"],
+  "time_contract": ["(short factual time/grain/anchor decisions)"],
+  "filter_contract": ["(short factual filter/status/code decisions)"],
+  "output_contract": ["(short factual projection/alias/order/limit decisions)"],
+  "risk_checklist": ["(short checks for zero-row or broad-filter risks)"],
+  "constraints_checklist": ["(short optional checks)"],
+  "candidates": [{"sql":"SELECT ..."}]
+}

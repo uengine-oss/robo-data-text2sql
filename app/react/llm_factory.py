@@ -44,9 +44,20 @@ def create_react_llm(
     max_output_tokens: Optional[int] = None,
     use_light: bool = False,
 ) -> ReactLLMHandle:
+    configured_thinking_level = (
+        getattr(settings, "light_llm_thinking_level", "")
+        if use_light
+        else getattr(settings, "llm_thinking_level", "")
+    )
+    configured_thinking_text = str(configured_thinking_level or "").strip()
+    if use_light:
+        # Empty LIGHT_LLM_THINKING_LEVEL means "do not request reasoning".
+        effective_thinking_level = configured_thinking_text or None
+    else:
+        effective_thinking_level = configured_thinking_text or thinking_level
     handle: LLMHandle = create_llm(
         purpose=purpose,
-        thinking_level=thinking_level,
+        thinking_level=effective_thinking_level,
         include_thoughts=include_thoughts,
         temperature=temperature,
         max_output_tokens=max_output_tokens,

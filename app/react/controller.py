@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import traceback
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+from xml.sax.saxutils import escape as _xml_escape
 
 from app.core.sql_mindsdb_prepare import (
     extract_passthrough_inner_sql,
@@ -19,6 +21,7 @@ from app.react.generators.controller_sql_candidates_generator import (
     get_controller_sql_candidates_generator,
 )
 from app.react.generators.controller_triage_generator import get_controller_triage_generator
+from app.react.context_compactor import compact_build_sql_context_for_prompt
 from app.react.rubric_judge import (
     compute_score_and_accept,
     create_rubric_llm,
@@ -155,6 +158,11 @@ def _extract_first_json(text: str) -> Optional[Dict[str, Any]]:
         return obj if isinstance(obj, dict) else None
     except Exception:
         return None
+
+
+def _is_falsey_env(v: Optional[str]) -> bool:
+    t = (v or "").strip().lower()
+    return t in {"0", "false", "no", "off"}
 
 
 def _looks_like_technical_user_request(text: str) -> bool:
@@ -426,6 +434,202 @@ def _same_fail_set(a: Sequence[str], b: Sequence[str]) -> bool:
     sa = set([str(x or "").strip() for x in (a or []) if str(x or "").strip()])
     sb = set([str(x or "").strip() for x in (b or []) if str(x or "").strip()])
     return sa == sb
+
+
+def _repair_regeneration_hint(
+    repair_meta: Optional[Dict[str, Any]],
+    failed_checks: Sequence[Dict[str, Any]],
+) -> str:
+    """
+    Convert a repair plan-only response into a compact candidate-generation hint.
+    Keeps the repair loop useful when small models avoid direct SQL editing.
+    """
+    meta = repair_meta if isinstance(repair_meta, dict) else {}
+    parts: List[str] = []
+    issue = str(meta.get("issue_choice") or "").strip()
+    if issue:
+        parts.append(f"Repair issue: {issue}.")
+    plan = meta.get("repair_plan")
+    if isinstance(plan, list):
+        steps = [str(x or "").strip() for x in plan if str(x or "").strip()]
+        if steps:
+            parts.append("Plan: " + " ".join(steps[:4]))
+    elif isinstance(plan, str) and plan.strip():
+        parts.append("Plan: " + plan.strip())
+    regen = str(meta.get("regenerate_hint") or "").strip()
+    if regen:
+        parts.append("Regenerate hint: " + regen)
+
+    failed_ids = {str(x.get("id") or "").strip() for x in (failed_checks or []) if isinstance(x, dict)}
+    if "__hard_preview__" in failed_ids:
+        parts.append(
+            "The previous SQL passed syntax but preview returned zero meaningful rows. "
+            "Generate a non-duplicate candidate that checks relative period anchor, exact equality/status/code filters, "
+            "broad LIKE/proxy filters, and unnecessary grouping/projection drift. "
+            "Preserve structured_generation_guidance output aliases, row count, ordering, and required grouping grain."
+        )
+
+    hint = " ".join([p for p in parts if p]).strip()
+    return hint[:1200]
+
+
+def _extract_sql_table_refs(sql: str) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for schema, table in re.findall(r'"([A-Za-z0-9_]+)"\."([A-Za-z0-9_]+)"', sql or ""):
+        fqn = f"{schema}.{table}"
+        key = fqn.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(fqn)
+    return out
+
+
+def _extract_xml_section(text: str, tag: str) -> str:
+    if not text:
+        return ""
+    m = re.search(rf"<{re.escape(tag)}\b[^>]*>[\s\S]*?</{re.escape(tag)}>", text, flags=re.IGNORECASE)
+    return m.group(0) if m else ""
+
+
+def _compact_context_for_repair(ctx_xml: str, current_sql: str, *, max_light_queries: int = 4) -> str:
+    """
+    Build a smaller repair-only context. Repair models need focused evidence more than
+    a large table catalog; this keeps table/column evidence for tables already used by
+    Current SQL plus light-query previews that bind user terms to values.
+    """
+    raw = (ctx_xml or "").strip()
+    if not raw:
+        return ""
+    refs = _extract_sql_table_refs(current_sql)
+    if not refs:
+        return raw[:24000]
+    wanted_tables = {x.split(".", 1)[-1].lower() for x in refs}
+
+    table_blocks: List[str] = []
+    per_cols = _extract_xml_section(raw, "per_table_columns")
+    for tb in re.findall(r"<table>[\s\S]*?</table>", per_cols):
+        m_name = re.search(r"<name>([\s\S]*?)</name>", tb)
+        name = (m_name.group(1) if m_name else "").strip().lower()
+        if name and name in wanted_tables:
+            table_blocks.append(tb)
+
+    light_blocks: List[str] = []
+    light_section = _extract_xml_section(raw, "light_queries")
+    for q in re.findall(r"<query\b[\s\S]*?</query>", light_section):
+        light_blocks.append(q)
+        if len(light_blocks) >= max(1, int(max_light_queries)):
+            break
+
+    resolved_values = _extract_xml_section(raw, "resolved_values")
+    column_value_hints = _extract_xml_section(raw, "column_value_hints")
+    ask_user_suggestions = _extract_xml_section(raw, "ask_user_suggestions")
+
+    parts = [
+        "<tool_result><build_sql_context_result>",
+        "<repair_context_note>",
+        _xml_escape(
+            "Focused repair context: includes Current SQL tables, value hints/resolved values, and light-query previews. "
+            "Use context_xml only as schema/value evidence; use structured_generation_guidance for the repair plan."
+        ),
+        "</repair_context_note>",
+        "<schema_candidates><per_table_columns>",
+        "".join(table_blocks),
+        "</per_table_columns></schema_candidates>",
+        column_value_hints or "<column_value_hints></column_value_hints>",
+        resolved_values or "<resolved_values></resolved_values>",
+        ask_user_suggestions or "",
+        "<light_queries>",
+        "".join(light_blocks),
+        "</light_queries>",
+        "</build_sql_context_result></tool_result>",
+    ]
+    compact = "".join(parts)
+    try:
+        ET.fromstring(compact)
+    except ET.ParseError:
+        return raw[:24000]
+    return compact
+
+
+def _build_repair_context_packet(
+    *,
+    question: str,
+    current_sql: str,
+    focused_context_xml: str,
+    failed_checks: Sequence[Dict[str, Any]],
+    structured_generation_guidance: Dict[str, Any],
+) -> Dict[str, Any]:
+    guidance = structured_generation_guidance if isinstance(structured_generation_guidance, dict) else {}
+    derived = guidance.get("derived_preferences") if isinstance(guidance.get("derived_preferences"), dict) else {}
+    return {
+        "purpose": "Public structured repair plan input. Use this to fill task_understanding, evidence_bindings, diagnosis, repair_contract, then sql.",
+        "question": (question or "").strip()[:800],
+        "current_sql_tables": _extract_sql_table_refs(current_sql)[:8],
+        "failed_checks": list(failed_checks or [])[:12],
+        "derived_preferences": derived,
+        "evidence_counts": {
+            "focused_context_chars": len(focused_context_xml or ""),
+            "table_time_anchors": len(guidance.get("table_time_anchors") or []),
+            "enum_value_evidence": len(guidance.get("enum_value_evidence") or []),
+            "code_name_candidates": len(guidance.get("code_name_candidates") or []),
+        },
+        "repair_plan_steps": [
+            "Bind the requested output to evidence in context_xml or structured_generation_guidance.",
+            "Identify the smallest mismatch in Current SQL.",
+            "State the time/filter/output/order/limit contract.",
+            "Return corrected SELECT-only SQL in sql.",
+        ],
+    }
+
+
+def _structured_guidance_for_repair(
+    *,
+    guidance: Dict[str, Any],
+    current_sql: str,
+    failed_checks: Sequence[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Repair should not be distracted by evidence for unrelated candidate tables.
+    Keep the deterministic question-shape hints, but filter table-specific evidence
+    to tables already present in Current SQL unless the failed checks indicate table
+    choice itself is the problem.
+    """
+    if not isinstance(guidance, dict) or not guidance:
+        return {}
+    current_tables = {x.lower() for x in _extract_sql_table_refs(current_sql)}
+    failed_text = " ".join(
+        [
+            str(x.get("id", "")) + " " + str(x.get("type", "")) + " " + str(x.get("text", "")) + " " + str(x.get("why", ""))
+            for x in (failed_checks or [])
+            if isinstance(x, dict)
+        ]
+    ).lower()
+    table_problem = bool(re.search(r"\btable\b|테이블|source|fact", failed_text, flags=re.IGNORECASE))
+
+    def _keep_table_item(item: Any) -> bool:
+        if table_problem or not current_tables:
+            return True
+        if not isinstance(item, dict):
+            return False
+        table = str(item.get("table") or item.get("fqn") or "").strip().lower()
+        return bool(table and table in current_tables)
+
+    out: Dict[str, Any] = {
+        "purpose": "Focused repair guidance. Preserve Current SQL tables unless failed_checks says table choice is wrong.",
+        "current_sql_tables": _extract_sql_table_refs(current_sql)[:8],
+        "derived_preferences": guidance.get("derived_preferences") if isinstance(guidance.get("derived_preferences"), dict) else {},
+        "risk_checklist": list(guidance.get("risk_checklist") or [])[:8],
+    }
+    preferred = guidance.get("preferred_tables")
+    if isinstance(preferred, list):
+        out["preferred_tables"] = [x for x in preferred if _keep_table_item(x)][:8]
+    for key in ("table_time_anchors", "enum_value_evidence", "code_name_candidates"):
+        items = guidance.get(key)
+        if isinstance(items, list):
+            out[key] = [x for x in items if _keep_table_item(x)][:8]
+    return {k: v for k, v in out.items() if v}
 
 
 def _failed_checks_payload(
@@ -833,6 +1037,270 @@ def _extract_resolved_values(tool_result_xml: str) -> List[Dict[str, str]]:
     return out
 
 
+def _preferred_tables_from_context(ctx_xml: str) -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
+    seen = set()
+    for item in _extract_per_table_columns(ctx_xml):
+        schema = str(item.get("schema") or "").strip().strip('"')
+        table = str(item.get("name") or "").strip().strip('"')
+        if not schema or not table:
+            continue
+        key = f"{schema.lower()}.{table.lower()}"
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"schema": schema, "table": table, "fqn": f"{schema}.{table}"})
+        if len(out) >= 8:
+            break
+    return out
+
+
+def _derive_generation_preferences_from_question(question: str) -> Dict[str, Any]:
+    q = str(question or "").strip()
+    prefs: Dict[str, Any] = {
+        "time_contract_hints": [],
+        "filter_contract_hints": [],
+        "output_contract_hints": [],
+        "risk_checklist": [],
+    }
+    if not q:
+        return prefs
+
+    recent_match = re.search(r"(최근|지난)\s*(\d+)\s*(일|주|개월|달)", q, flags=re.IGNORECASE)
+    if recent_match:
+        n = recent_match.group(2)
+        unit = recent_match.group(3)
+        prefs["time_contract_hints"].append(
+            f"Relative period detected: last {n} {unit}; prefer data-latest anchor when table_time_anchors evidence exists."
+        )
+        if unit == "일":
+            prefs["output_contract_hints"].append(f"If the result is grouped daily, return {n} daily rows when possible.")
+        prefs["risk_checklist"].append("Avoid CURRENT_DATE/system-time anchoring when data-latest evidence is available.")
+
+    if re.search(r"(최근|최신|latest|recent)", q, flags=re.IGNORECASE):
+        prefs["time_contract_hints"].append("For recent/latest trend results, prefer newest-first ordering unless explicitly asked otherwise.")
+        prefs["output_contract_hints"].append("Prefer DESC ordering for recent/latest trend outputs.")
+    if re.search(r"(가장\s*최근|최신|latest)", q, flags=re.IGNORECASE) and not re.search(
+        r"(추이|trend|일별|월별|daily|monthly|최근\s*\d+)", q, flags=re.IGNORECASE
+    ):
+        prefs["time_contract_hints"].append("Latest single-record lookup detected: order by the time column DESC.")
+        prefs["output_contract_hints"].append("For latest single-record lookup, return exactly one row with LIMIT 1.")
+        prefs["output_contract_hints"].append(
+            "For measurement-record output, include identifier, descriptive name/label if available, time, and value columns."
+        )
+    if re.search(r"(전체|모든|전기간|전체기간|full history|all periods)", q, flags=re.IGNORECASE):
+        prefs["time_contract_hints"].append("Full-history intent detected: do not add a time filter.")
+        prefs["risk_checklist"].append("Do not add time grouping unless the user explicitly asks for per-day/per-month/per-period output rows.")
+
+    if re.search(r"(일별|일일|daily|날짜)", q, flags=re.IGNORECASE):
+        prefs["output_contract_hints"].append(
+            "For daily grouping on compact timestamps, project a YYYYMMDD date expression and prefer a concise date alias such as ymd."
+        )
+
+    if re.search(r"(평균|avg|average)", q, flags=re.IGNORECASE):
+        prefs["output_contract_hints"].append(
+            "For average metrics, prefer ROUND(AVG(...), 4) when supported and use a concise semantic alias such as avg_<metric>."
+        )
+    if re.search(r"(건수|개수|카운트|count)", q, flags=re.IGNORECASE):
+        prefs["output_contract_hints"].append("For count metrics, use COUNT(*) with a concise semantic alias such as *_count.")
+        if re.search(r"(위반|실패|fail|failure)", q, flags=re.IGNORECASE):
+            prefs["output_contract_hints"].append("For failure/violation counts, prefer the concise alias fail_count when appropriate.")
+    if re.search(r"(합계|총합|sum)", q, flags=re.IGNORECASE):
+        prefs["output_contract_hints"].append("For sum metrics, use SUM(...) with a concise semantic alias such as total_* or sum_*.")
+
+    if re.search(r"(위반|실패|fail|failure)", q, flags=re.IGNORECASE):
+        prefs["filter_contract_hints"].append(
+            "If status-like enum evidence contains FAIL or an equivalent failure value, prefer exact status equality over proxy numeric filters."
+        )
+        prefs["risk_checklist"].append("Avoid broad/proxy failure filters when exact status evidence exists.")
+    if re.search(r"(규정|rule|policy|category)", q, flags=re.IGNORECASE):
+        prefs["filter_contract_hints"].append(
+            "If the question describes one named rule/category and code-name evidence has a narrow matching row, choose one exact code predicate rather than a broad IN list."
+        )
+        prefs["risk_checklist"].append(
+            "Words like monthly/daily can describe a rule/category name; do not turn them into output time grouping unless the user asks for monthly/daily rows."
+        )
+    if re.search(r"(평균|avg|average)", q, flags=re.IGNORECASE) and re.search(r"(값|value|result)", q, flags=re.IGNORECASE):
+        prefs["output_contract_hints"].append(
+            "When averaging a source column named RESULT_VALUE or similar result/value column, prefer alias avg_result_value."
+        )
+
+    return {k: v for k, v in prefs.items() if v}
+
+
+def _candidate_diversity_hints_for_question(question: str) -> List[str]:
+    q = str(question or "")
+    latest_single = bool(
+        re.search(r"(가장\s*최근|최신|latest)", q, flags=re.IGNORECASE)
+        and not re.search(r"(추이|trend|일별|월별|daily|monthly|최근\s*\d+)", q, flags=re.IGNORECASE)
+    )
+    if latest_single:
+        return [
+            "Strategy A: Latest single-record lookup. Join fact table to descriptor/entity table, filter exact ID/name evidence, select identifier, descriptor/name, time, value, ORDER BY time DESC LIMIT 1.",
+            "Strategy B: Latest single-record lookup with a CTE resolving the target entity/descriptor first, then join the fact table, ORDER BY time DESC LIMIT 1.",
+            "Strategy C: Latest single-record lookup using EXISTS for the entity/name constraint, but still select descriptor/name if available, ORDER BY time DESC LIMIT 1.",
+        ]
+    if re.search(r"(일별|일일|daily|추이|trend)", q, flags=re.IGNORECASE):
+        return [
+            "Strategy A: Use a straight JOIN path from the primary fact table to the entity table; filter entity by NAME if available; GROUP BY day.",
+            "Strategy B: Use a CTE to resolve entity CODE/ID from entity NAME first, then join fact tables by CODE/ID; keep aggregates and GROUP BY day.",
+            "Strategy C: Use EXISTS subquery (instead of JOIN filter) for entity constraint; keep output minimal and correct grain.",
+        ]
+    return [
+        "Strategy A: Use the narrowest matching fact table and exact equality filters from evidence; keep SELECT/GROUP BY aligned with the requested output columns.",
+        "Strategy B: Use CTEs only to resolve exact code/name/status evidence, then aggregate at the requested entity/rule/category grain.",
+        "Strategy C: Use EXISTS or JOIN alternatives for entity constraints, avoiding broad IN/proxy filters when one exact evidence match exists.",
+    ]
+
+
+async def _execute_inner_evidence_query(
+    tool_context: ToolContext,
+    *,
+    datasource: str,
+    inner_sql: str,
+    max_rows: int = 20,
+) -> Dict[str, Any]:
+    sql = wrap_inner_sql_as_passthrough(inner_sql, datasource) if datasource else inner_sql
+    started = time.perf_counter()
+    async with tool_context.db_conn.cursor() as cur:
+        await cur.execute(sql)
+        rows = await cur.fetchall()
+        cols = [d[0] for d in cur.description] if cur.description else []
+    rows_out: List[List[Any]] = []
+    for row in list(rows or [])[: max(1, int(max_rows))]:
+        rows_out.append([str(v).strip() if v is not None else None for v in row])
+    return {
+        "columns": [str(c) for c in cols],
+        "rows": rows_out,
+        "row_count": len(rows_out),
+        "elapsed_ms": round((time.perf_counter() - started) * 1000.0, 2),
+    }
+
+
+def _quote_ident(name: str) -> str:
+    return '"' + str(name or "").replace('"', '""') + '"'
+
+
+def _context_mentions_table_column(ctx_xml: str, *, table: str, column: str) -> bool:
+    text = str(ctx_xml or "")
+    if not text:
+        return False
+    table_pos = text.lower().find(str(table or "").lower())
+    col_pos = text.lower().find(str(column or "").lower())
+    if table_pos < 0 or col_pos < 0:
+        return False
+    return abs(table_pos - col_pos) < 5000
+
+
+async def _build_structured_generation_guidance(
+    *,
+    question: str,
+    ctx_xml: str,
+    tool_context: ToolContext,
+    datasource: str,
+) -> Dict[str, Any]:
+    """
+    Small, generic evidence packet for models that need explicit pre-SQL planning.
+    No separate LLM-generated planning contract is used here. Probes are driven by retrieved tables,
+    visible columns/descriptions, and deterministic question-shape hints.
+    """
+    if _is_falsey_env(os.environ.get("REACT_STRUCTURED_GENERATION_GUIDANCE_ENABLED", "1")):
+        return {}
+    preferred = _preferred_tables_from_context(ctx_xml)
+    if not preferred:
+        return {}
+    per_tables = _extract_per_table_columns(ctx_xml)
+    cols_by_key: Dict[str, List[Dict[str, str]]] = {}
+    for t in per_tables:
+        key = f"{str(t.get('schema') or '').lower()}.{str(t.get('name') or '').lower()}"
+        cols_by_key[key] = list(t.get("cols") or [])
+
+    evidence: Dict[str, Any] = {
+        "purpose": "Use these concise evidence bindings before generating SQL.",
+        "preferred_tables": preferred,
+        "table_time_anchors": [],
+        "enum_value_evidence": [],
+        "code_name_candidates": [],
+        "derived_preferences": _derive_generation_preferences_from_question(question),
+        "risk_checklist": [
+            "If relative period is requested and data_latest evidence exists, do not anchor to CURRENT_DATE.",
+            "If exact code/status evidence exists, do not replace it with broad LIKE/proxy filters.",
+            "Before final SQL, verify output aliases, row count, ordering, and grouping.",
+        ],
+    }
+
+    for table_ref in preferred[:6]:
+        schema = table_ref["schema"]
+        table = table_ref["table"]
+        key = f"{schema.lower()}.{table.lower()}"
+        cols = cols_by_key.get(key, [])
+        col_names = [str(c.get("name") or "").strip() for c in cols if str(c.get("name") or "").strip()]
+
+        time_cols = [
+            c
+            for c in col_names
+            if re.search(r"(log_time|time|date|dt|created_at|window_start|window_end)$", c, flags=re.IGNORECASE)
+        ][:2]
+        for col in time_cols:
+            try:
+                sql = f"SELECT MAX({_quote_ident(col)}) AS max_{col.lower()} FROM {_quote_ident(schema)}.{_quote_ident(table)}"
+                result = await _execute_inner_evidence_query(tool_context, datasource=datasource, inner_sql=sql, max_rows=1)
+                if result.get("rows"):
+                    evidence["table_time_anchors"].append({"table": f"{schema}.{table}", "column": col, "preview": result})
+            except Exception:
+                continue
+
+        status_cols = [c for c in col_names if re.search(r"(status|state|flag|yn)$", c, flags=re.IGNORECASE)]
+        for fallback_col in ("RESULT_STATUS", "STATUS"):
+            if fallback_col not in status_cols and _context_mentions_table_column(ctx_xml, table=table, column=fallback_col):
+                status_cols.append(fallback_col)
+        for col in status_cols[:3]:
+            try:
+                sql = (
+                    f"SELECT DISTINCT {_quote_ident(col)} AS value "
+                    f"FROM {_quote_ident(schema)}.{_quote_ident(table)} "
+                    f"WHERE {_quote_ident(col)} IS NOT NULL ORDER BY value LIMIT 20"
+                )
+                result = await _execute_inner_evidence_query(tool_context, datasource=datasource, inner_sql=sql, max_rows=20)
+                if result.get("rows"):
+                    evidence["enum_value_evidence"].append({"table": f"{schema}.{table}", "column": col, "preview": result})
+            except Exception:
+                continue
+
+        code_cols = [c for c in col_names if re.search(r"(^|_)(code|cd|id|sn)$", c, flags=re.IGNORECASE)]
+        name_cols = [c for c in col_names if re.search(r"(^|_)(name|nm|title|desc)$", c, flags=re.IGNORECASE)]
+        if code_cols and name_cols:
+            try:
+                code_col = code_cols[0]
+                name_col = name_cols[0]
+                extra_cols = [
+                    c for c in col_names
+                    if c not in {code_col, name_col}
+                    and re.search(r"(param|type|kind|category|group|size|unit|status|yn)$", c, flags=re.IGNORECASE)
+                ][:4]
+                select_cols = [
+                    f"{_quote_ident(code_col)} AS code",
+                    f"{_quote_ident(name_col)} AS name",
+                ] + [f"{_quote_ident(c)} AS {_quote_ident(c.lower())}" for c in extra_cols]
+                sql = (
+                    f"SELECT {', '.join(select_cols)} "
+                    f"FROM {_quote_ident(schema)}.{_quote_ident(table)} "
+                    f"WHERE {_quote_ident(code_col)} IS NOT NULL ORDER BY {_quote_ident(code_col)} LIMIT 20"
+                )
+                result = await _execute_inner_evidence_query(tool_context, datasource=datasource, inner_sql=sql, max_rows=20)
+                if result.get("rows"):
+                    evidence["code_name_candidates"].append(
+                        {"table": f"{schema}.{table}", "code_column": code_col, "name_column": name_col, "preview": result}
+                    )
+            except Exception:
+                continue
+
+    # Keep payload compact.
+    for key in ("table_time_anchors", "enum_value_evidence", "code_name_candidates"):
+        evidence[key] = evidence.get(key, [])[:8]
+    return evidence
+
+
 async def draft_llm_candidates(
     *,
     question: str,
@@ -844,6 +1312,7 @@ async def draft_llm_candidates(
     compact_context: str,
     conversation_context: Optional[Dict[str, Any]] = None,
     n_candidates: int,
+    structured_generation_guidance: Optional[Dict[str, Any]] = None,
     temperature: Optional[float] = None,
     diversity_hints: Optional[List[str]] = None,
     seed: Optional[int] = None,
@@ -858,6 +1327,7 @@ async def draft_llm_candidates(
         max_sql_seconds=max_sql_seconds,
         context_xml=compact_context,
         conversation_context=conversation_context,
+        structured_generation_guidance=structured_generation_guidance,
         n_candidates=int(n_candidates),
         temperature=temperature,
         diversity_hints=diversity_hints,
@@ -869,15 +1339,15 @@ async def draft_llm_candidates(
 
 def compact_build_sql_context(tool_result_xml: str, *, max_tables: int = 12, max_cols: int = 20) -> str:
     """
-    Legacy: historically compacted build_sql_context for prompt size.
+    Compact build_sql_context only for LLM prompt payloads.
 
-    New behavior (A-1): return the original tool_result XML as-is so the controller can use
-    the full context (including <schema_candidates>, <column_value_hints>, <fk_relationships>,
-    and <light_queries> previews).
+    Internal parsers still receive the original XML (`ctx_xml`). This keeps metadata merge and
+    context evidence extraction stable while reducing safe XML overhead in candidate, repair,
+    and triage prompts.
     """
     _ = max_tables
     _ = max_cols
-    return (tool_result_xml or "").strip()
+    return compact_build_sql_context_for_prompt(tool_result_xml)
 
 
 @dataclass
@@ -1329,6 +1799,43 @@ async def run_controller(
             return sanitize_sql(inner)
         return sanitize_sql(fallback_sql) or s
 
+    structured_generation_guidance: Dict[str, Any] = {}
+    try:
+        structured_generation_guidance = await _build_structured_generation_guidance(
+            question=question,
+            ctx_xml=compact_ctx,
+            tool_context=tool_context,
+            datasource=datasource,
+        )
+        if structured_generation_guidance:
+            try:
+                SmartLogger.log(
+                    "INFO",
+                    "react.controller.structured_generation_guidance",
+                    category="react.controller",
+                    params=sanitize_for_log(
+                        {
+                            "time_anchors": len(structured_generation_guidance.get("table_time_anchors") or []),
+                            "enum_values": len(structured_generation_guidance.get("enum_value_evidence") or []),
+                            "code_name_candidates": len(structured_generation_guidance.get("code_name_candidates") or []),
+                        }
+                    ),
+                    max_inline_chars=0,
+                )
+            except Exception:
+                pass
+    except Exception as exc:
+        try:
+            SmartLogger.log(
+                "WARNING",
+                "react.controller.structured_generation_guidance.failed",
+                category="react.controller",
+                params=sanitize_for_log({"error": repr(exc)}),
+                max_inline_chars=0,
+            )
+        except Exception:
+            pass
+
     async def _evaluate_once(
         *,
         sql_in: str,
@@ -1464,12 +1971,8 @@ async def run_controller(
     init_n = max(1, init_n)
     init_n = int(min(init_n, max(1, int(getattr(config, "n_candidates", 2) or 2))))
 
-    # Candidate diversity hints (generic, domain-agnostic).
-    diversity_hints = [
-        "Strategy A: Use a straight JOIN path from the primary fact table to the entity table; filter entity by NAME if available; GROUP BY day.",
-        "Strategy B: Use a CTE to resolve entity CODE/ID from entity NAME first, then join fact tables by CODE/ID; keep aggregates and GROUP BY day.",
-        "Strategy C: Use EXISTS subquery (instead of JOIN filter) for entity constraint; keep output minimal and correct grain.",
-    ]
+    # Candidate diversity hints (generic, domain-agnostic, question-shape aware).
+    diversity_hints = _candidate_diversity_hints_for_question(question)
     cand_temp = float(getattr(config, "candidate_temperature", 0.0) or 0.0)
     controller_seq += 1
     cand_started = time.perf_counter()
@@ -1483,6 +1986,7 @@ async def run_controller(
         max_sql_seconds=max_sql_seconds,
         compact_context=compact_ctx,
         conversation_context=conversation_context,
+        structured_generation_guidance=structured_generation_guidance,
         n_candidates=int(init_n),
         temperature=cand_temp,
         diversity_hints=diversity_hints[: max(1, int(init_n))],
@@ -1715,7 +2219,20 @@ async def run_controller(
 
         repair_temp = float(getattr(config, "repair_temperature", 0.0) or 0.0)
         gen = get_controller_repair_generator()
-        revised_raw, _mode = await gen.generate(
+        repair_prompt_ctx = _compact_context_for_repair(compact_ctx, active_sql)
+        repair_guidance = _structured_guidance_for_repair(
+            guidance=structured_generation_guidance,
+            current_sql=active_sql,
+            failed_checks=active_failed_payload,
+        )
+        repair_context = _build_repair_context_packet(
+            question=question,
+            current_sql=active_sql,
+            focused_context_xml=repair_prompt_ctx,
+            failed_checks=active_failed_payload,
+            structured_generation_guidance=repair_guidance,
+        )
+        revised_raw, repair_mode, repair_meta = await gen.generate_with_plan(
             question=question,
             generation_mode=generation_mode or None,
             inner_dbms=inner_dbms or None,
@@ -1725,13 +2242,67 @@ async def run_controller(
             passed_must_ids=list(active_passed_must_ids or [])[:48],
             suggested_fixes=list(active_suggested_fixes or [])[:12],
             auto_rewrite=dict(active_auto_rewrite or {}) if isinstance(active_auto_rewrite, dict) else {},
-            context_xml=compact_ctx,
+            context_xml=repair_prompt_ctx,
             conversation_context=conversation_context,
+            structured_generation_guidance=repair_guidance,
+            repair_context=repair_context,
             current_sql=active_sql,
             temperature=repair_temp,
             react_run_id=None,
         )
         revised = sanitize_sql(str(revised_raw or ""))
+        if not revised:
+            regen_hint = _repair_regeneration_hint(repair_meta, active_failed_payload)
+            if regen_hint:
+                try:
+                    regen_raw = await draft_llm_candidates(
+                        question=question,
+                        dbms=dbms,
+                        generation_mode=generation_mode or None,
+                        inner_dbms=inner_dbms or None,
+                        datasource=datasource or None,
+                        max_sql_seconds=max_sql_seconds,
+                        compact_context=compact_ctx,
+                        conversation_context=conversation_context,
+                        structured_generation_guidance=structured_generation_guidance,
+                        n_candidates=1,
+                        temperature=cand_temp,
+                        diversity_hints=[regen_hint],
+                        seed=rr,
+                    )
+                    for regen_sql in regen_raw:
+                        candidate = sanitize_sql(regen_sql)
+                        if candidate and _norm_sql_key(candidate) != _norm_sql_key(active_sql):
+                            revised = candidate
+                            break
+                    try:
+                        SmartLogger.log(
+                            "INFO",
+                            "react.controller_repair.regeneration_attempt",
+                            category="react.controller_repair",
+                            params=sanitize_for_log(
+                                {
+                                    "repair_round": int(rr),
+                                    "repair_mode": str(repair_mode or ""),
+                                    "hint_preview": regen_hint[:300],
+                                    "generated": bool(revised),
+                                }
+                            ),
+                            max_inline_chars=0,
+                        )
+                    except Exception:
+                        pass
+                except Exception as exc:
+                    try:
+                        SmartLogger.log(
+                            "WARNING",
+                            "react.controller_repair.regeneration_failed",
+                            category="react.controller_repair",
+                            params=sanitize_for_log({"repair_round": int(rr), "exception": repr(exc)}),
+                            max_inline_chars=0,
+                        )
+                    except Exception:
+                        pass
         if not revised:
             stall += 1
         else:

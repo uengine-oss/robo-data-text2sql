@@ -56,6 +56,23 @@ class Settings(BaseSettings):
     # Example: http://localhost:11434/v1 (Ollama), https://<gateway>/v1, etc.
     llm_provider_url: str = ""
     light_llm_provider_url: str = ""
+    # Optional Google thinking override. For Gemma 4 31B, currently only "high" is accepted.
+    llm_thinking_level: str = ""
+    light_llm_thinking_level: str = ""
+    # OpenRouter routing preferences (used only when provider_url points to openrouter.ai).
+    openrouter_provider_only: str = ""
+    openrouter_provider_order: str = ""
+    openrouter_provider_allow_fallbacks: str = ""
+    openrouter_provider_require_parameters: str = ""
+    openrouter_provider_sort_by: str = ""
+    openrouter_provider_sort_partition: str = ""
+    openrouter_models: str = ""
+    # Optional OpenRouter reasoning control.
+    # - empty/auto: send reasoning only when requested and model is not in disabled list.
+    # - true/false: globally allow/disable reasoning payloads.
+    # Gemma 4 31B is disabled by default because OpenRouter reasoning.effort can produce empty responses.
+    openrouter_reasoning_enabled: str = ""
+    openrouter_reasoning_disabled_models: str = "google/gemma-4-31b-it,gemma-4-31b-it"
 
     is_use_llm_cache: bool = False
     llm_cache_path: str = ".cache/llm_cache.db"

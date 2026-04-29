@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import inspect
 import os
+import json
 from functools import lru_cache
 from dataclasses import dataclass
 from typing import Any, Dict, Literal, Optional, Union
@@ -135,6 +136,153 @@ def _require_embedding_api_key(*, provider: str) -> str:
     return key
 
 
+def _is_google_gemma_model(model: str) -> bool:
+    mdl = (model or "").strip().lower()
+    return mdl.startswith("gemma-") or mdl.startswith("models/gemma-")
+
+
+def _google_thinking_kwargs(
+    *,
+    model: str,
+    thinking_level: Optional[str],
+    include_thoughts: bool,
+) -> Dict[str, Any]:
+    level = (thinking_level or "").strip().lower()
+    if not level:
+        return {}
+    if _is_google_gemma_model(model) and level != "high":
+        # Gemma 4 31B rejects low/medium/minimal and thinking budgets.
+        return {}
+    return {"thinking_level": level, "include_thoughts": bool(include_thoughts)}
+
+
+def _openrouter_extra_body(
+    *,
+    base_url: str,
+    model: str = "",
+    thinking_level: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    if "openrouter.ai" not in (base_url or "").lower():
+        return None
+
+    provider: Dict[str, Any] = {}
+    only_raw = (
+        os.getenv("OPENROUTER_PROVIDER_ONLY", "")
+        or getattr(settings, "openrouter_provider_only", "")
+        or ""
+    ).strip()
+    if only_raw:
+        provider["only"] = [item.strip() for item in only_raw.split(",") if item.strip()]
+
+    order_raw = (
+        os.getenv("OPENROUTER_PROVIDER_ORDER", "")
+        or getattr(settings, "openrouter_provider_order", "")
+        or ""
+    ).strip()
+    if order_raw:
+        provider["order"] = [item.strip() for item in order_raw.split(",") if item.strip()]
+
+    allow_fallbacks_raw = (
+        os.getenv("OPENROUTER_PROVIDER_ALLOW_FALLBACKS", "")
+        or getattr(settings, "openrouter_provider_allow_fallbacks", "")
+        or ""
+    ).strip().lower()
+    if allow_fallbacks_raw in {"true", "1", "yes", "y", "on"}:
+        provider["allow_fallbacks"] = True
+    elif allow_fallbacks_raw in {"false", "0", "no", "n", "off"}:
+        provider["allow_fallbacks"] = False
+
+    require_params_raw = (
+        os.getenv("OPENROUTER_PROVIDER_REQUIRE_PARAMETERS", "")
+        or getattr(settings, "openrouter_provider_require_parameters", "")
+        or ""
+    ).strip().lower()
+    if require_params_raw in {"true", "1", "yes", "y", "on"}:
+        provider["require_parameters"] = True
+    elif require_params_raw in {"false", "0", "no", "n", "off"}:
+        provider["require_parameters"] = False
+
+    sort_by = (
+        os.getenv("OPENROUTER_PROVIDER_SORT_BY", "")
+        or getattr(settings, "openrouter_provider_sort_by", "")
+        or ""
+    ).strip()
+    sort_partition = (
+        os.getenv("OPENROUTER_PROVIDER_SORT_PARTITION", "")
+        or getattr(settings, "openrouter_provider_sort_partition", "")
+        or ""
+    ).strip()
+    if sort_by:
+        sort: Dict[str, Any] = {"by": sort_by}
+        if sort_partition:
+            sort["partition"] = sort_partition
+        provider["sort"] = sort
+
+    extra_body: Dict[str, Any] = {}
+    if provider:
+        extra_body["provider"] = provider
+
+    reasoning_level = (thinking_level or "").strip().lower()
+    if reasoning_level and _should_send_openrouter_reasoning(model=model):
+        extra_body["reasoning"] = {"effort": reasoning_level}
+
+    models_raw = (
+        os.getenv("OPENROUTER_MODELS", "")
+        or getattr(settings, "openrouter_models", "")
+        or ""
+    ).strip()
+    if models_raw:
+        try:
+            models = json.loads(models_raw)
+            if isinstance(models, list) and all(isinstance(item, str) for item in models):
+                extra_body["models"] = models
+        except json.JSONDecodeError:
+            models = [item.strip() for item in models_raw.split(",") if item.strip()]
+            if models:
+                extra_body["models"] = models
+
+    return extra_body or None
+
+
+def _truthy_env_text(value: str) -> Optional[bool]:
+    v = (value or "").strip().lower()
+    if v in {"true", "1", "yes", "y", "on"}:
+        return True
+    if v in {"false", "0", "no", "n", "off"}:
+        return False
+    return None
+
+
+def _split_csv_text(value: str) -> list[str]:
+    return [x.strip().lower() for x in (value or "").split(",") if x.strip()]
+
+
+def _should_send_openrouter_reasoning(*, model: str) -> bool:
+    enabled_raw = (
+        os.getenv("OPENROUTER_REASONING_ENABLED", "")
+        or getattr(settings, "openrouter_reasoning_enabled", "")
+        or ""
+    )
+    enabled = _truthy_env_text(enabled_raw)
+    if enabled is False:
+        return False
+
+    mdl = (model or "").strip().lower()
+    disabled_raw = (
+        os.getenv("OPENROUTER_REASONING_DISABLED_MODELS", "")
+        or getattr(settings, "openrouter_reasoning_disabled_models", "")
+        or ""
+    )
+    disabled_models = _split_csv_text(disabled_raw)
+    if mdl and any(mdl == disabled or mdl.endswith("/" + disabled) for disabled in disabled_models):
+        return False
+
+    # Auto mode: reasoning is allowed for models not explicitly disabled.
+    # Explicit true also cannot override a per-model disabled entry; remove the model
+    # from OPENROUTER_REASONING_DISABLED_MODELS if a future provider fixes support.
+    return True
+
+
 def _get_embedding_base_url(*, provider: str) -> str:
     if provider == "openai":
         return ""
@@ -220,6 +368,7 @@ def create_llm(
             # - Some accept `openai_api_base`
             "base_url": base_url or None,
             "openai_api_base": base_url or None,
+            "extra_body": _openrouter_extra_body(base_url=base_url, model=mdl, thinking_level=thinking_level),
         }
         kwargs = _filter_init_kwargs(ChatOpenAI, raw_kwargs)
         llm = ChatOpenAI(**kwargs)
@@ -238,10 +387,15 @@ def create_llm(
         "model": mdl,
         "google_api_key": api_key,
         "temperature": float(temperature),
-        "thinking_level": thinking_level,
-        "include_thoughts": bool(include_thoughts),
         "max_output_tokens": int(max_output_tokens) if max_output_tokens is not None else None,
     }
+    raw_kwargs.update(
+        _google_thinking_kwargs(
+            model=mdl,
+            thinking_level=thinking_level,
+            include_thoughts=include_thoughts,
+        )
+    )
     kwargs = _filter_init_kwargs(ChatGoogleGenerativeAI, raw_kwargs)
     llm = ChatGoogleGenerativeAI(**kwargs)
     try:

@@ -66,15 +66,49 @@ def extract_context_evidence(build_sql_context_xml: str, *, max_items: int = 10)
     if not text.strip():
         return {}
 
-    out: Dict[str, Any] = {"facility_mappings": [], "br_code_hints": []}
+    out: Dict[str, Any] = {"facility_mappings": [], "br_code_hints": [], "available_tables": [], "light_query_evidence": []}
 
     try:
+        available_tables: List[str] = []
+        for schema, name in re.findall(r"<table>\s*<schema>([^<]*)</schema>\s*<name>([^<]*)</name>", text):
+            fqn = f"{schema.strip()}.{name.strip()}".strip(".")
+            if fqn and fqn not in available_tables:
+                available_tables.append(fqn)
+
         # Prefer light_queries section if present
         m_light = re.search(r"<light_queries>[\s\S]*?</light_queries>", text)
         block = m_light.group(0) if m_light else text
 
         facilities: List[Dict[str, str]] = []
         brs: List[Dict[str, str]] = []
+        light_evidence: List[Dict[str, Any]] = []
+
+        for q_m in re.finditer(r"<query\b[^>]*>([\s\S]*?)</query>", block):
+            q = q_m.group(1)
+            verdict = (re.search(r"<verdict>([\s\S]*?)</verdict>", q).group(1).strip() if re.search(r"<verdict>([\s\S]*?)</verdict>", q) else "")
+            if verdict.upper() != "PASS":
+                continue
+            purpose = (re.search(r"<purpose>([\s\S]*?)</purpose>", q).group(1).strip() if re.search(r"<purpose>([\s\S]*?)</purpose>", q) else "")
+            sql_text = ""
+            m_sql = re.search(r"<sql><!\[CDATA\[([\s\S]*?)\]\]></sql>", q)
+            if m_sql:
+                sql_text = m_sql.group(1).strip()
+            q_tables = []
+            for schema, table in re.findall(r'"([A-Za-z0-9_]+)"\."([A-Za-z0-9_]+)"', sql_text):
+                fqn = f"{schema}.{table}"
+                if fqn not in q_tables:
+                    q_tables.append(fqn)
+            cols = []
+            for c in re.findall(r"<columns>[\s\S]*?</columns>", q):
+                cols.extend([x.strip() for x in re.findall(r"<column>([^<]*)</column>", c) if x.strip()])
+            if purpose or q_tables or cols:
+                light_evidence.append(
+                    {
+                        "purpose": purpose[:180],
+                        "tables": q_tables[:6],
+                        "columns": cols[:12],
+                    }
+                )
 
         for row_m in re.finditer(r"<row index=\"\d+\">([\s\S]*?)</row>", block):
             row = row_m.group(1)
@@ -109,6 +143,8 @@ def extract_context_evidence(build_sql_context_xml: str, *, max_items: int = 10)
 
         out["facility_mappings"] = uniq_f[: max(1, int(max_items))]
         out["br_code_hints"] = uniq_b[: max(1, int(max_items))]
+        out["available_tables"] = available_tables[: max(1, int(max_items) * 2)]
+        out["light_query_evidence"] = light_evidence[: max(1, int(max_items))]
     except Exception:
         # Fail-open: evidence missing is acceptable
         return {}

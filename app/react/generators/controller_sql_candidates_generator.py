@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from app.react.generators._repro_log import PromptMeta, log_llm_repro
+from app.react.generators.passthrough_dialect_prompt import render_passthrough_dialect_prompt
 from app.react.llm_factory import ReactLLMHandle, create_react_llm
 from app.react.prompts import get_prompt_text
 from app.react.utils.log_sanitize import sanitize_for_log
@@ -134,6 +135,7 @@ class ControllerSqlCandidatesGenerator:
         context_xml: str,
         conversation_context: Optional[Dict[str, Any]] = None,
         n_candidates: int,
+        structured_generation_guidance: Optional[Dict[str, Any]] = None,
         temperature: Optional[float] = None,
         diversity_hints: Optional[List[str]] = None,
         seed: Optional[int] = None,
@@ -164,6 +166,8 @@ class ControllerSqlCandidatesGenerator:
             # Keep payload bounded (avoid sending huge data by accident)
             # The caller should already cap/trim; we add a shallow safeguard here.
             payload["conversation_context"] = conversation_context
+        if isinstance(structured_generation_guidance, dict) and structured_generation_guidance:
+            payload["structured_generation_guidance"] = structured_generation_guidance
         if isinstance(diversity_hints, list):
             payload["diversity_hints"] = [str(x or "").strip()[:400] for x in diversity_hints if str(x or "").strip()][:12]
         if seed is not None:
@@ -172,8 +176,14 @@ class ControllerSqlCandidatesGenerator:
             except Exception:
                 payload["seed"] = str(seed)[:40]
         human_text = json.dumps(payload, ensure_ascii=False)
+        system_prompt = render_passthrough_dialect_prompt(
+            self.system_prompt,
+            generation_mode=generation_mode,
+            inner_dbms=inner_dbms,
+        )
+        prompt_meta = PromptMeta(prompt_file=self._PROMPT_FILE, prompt_text=system_prompt)
         messages = [
-            SystemMessage(content=self.system_prompt),
+            SystemMessage(content=system_prompt),
             HumanMessage(content=human_text),
         ]
 
@@ -189,9 +199,9 @@ class ControllerSqlCandidatesGenerator:
                 generator="controller_sql_candidates_generator",
                 llm_provider=llm_handle.provider,
                 llm_model=llm_handle.model,
-                prompt=self.prompt_meta,
+                prompt=prompt_meta,
                 input_payload=payload,
-                messages_payload={"system": self.system_prompt, "human": human_text},
+                messages_payload={"system": system_prompt, "human": human_text},
                 mode="json_text",
                 elapsed_ms=None,
                 response_raw=None,
@@ -253,9 +263,9 @@ class ControllerSqlCandidatesGenerator:
             generator="controller_sql_candidates_generator",
             llm_provider=llm_handle.provider,
             llm_model=llm_handle.model,
-            prompt=self.prompt_meta,
+            prompt=prompt_meta,
             input_payload=payload,
-            messages_payload={"system": self.system_prompt, "human": human_text},
+            messages_payload={"system": system_prompt, "human": human_text},
             mode="json_text",
             elapsed_ms=elapsed_ms,
             response_raw=text,

@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from app.react.generators._repro_log import PromptMeta, log_llm_repro
+from app.react.generators.passthrough_dialect_prompt import render_passthrough_dialect_prompt
 from app.react.llm_factory import ReactLLMHandle, create_react_llm
 from app.react.prompts import get_prompt_text
 from app.react.utils.log_sanitize import sanitize_for_log
@@ -63,6 +64,8 @@ class ControllerRepairGenerator:
         self.prompt_meta = PromptMeta(prompt_file=self._PROMPT_FILE, prompt_text=self.system_prompt)
         self._handles: Dict[str, ReactLLMHandle] = {}
         self.default_temperature: float = self._read_default_temperature()
+        self.default_thinking_level: Optional[str] = self._read_default_thinking_level()
+        self.default_max_output_tokens: int = self._read_default_max_output_tokens()
         self.llm_handle: ReactLLMHandle = self._get_llm_handle(self.default_temperature)
 
     @staticmethod
@@ -83,18 +86,43 @@ class ControllerRepairGenerator:
                 continue
         return 0.0
 
+    @staticmethod
+    def _read_default_thinking_level() -> Optional[str]:
+        """
+        Repair prompts are long and require direct JSON content. For OpenRouter-hosted
+        Gemma, omitting reasoning is more stable than requesting low reasoning.
+        """
+        raw = os.environ.get("REACT_CONTROLLER_REPAIR_THINKING_LEVEL")
+        if raw is None:
+            return None
+        level = str(raw).strip()
+        if not level or level.lower() in {"none", "off", "false", "0"}:
+            return None
+        return level
+
+    @staticmethod
+    def _read_default_max_output_tokens() -> int:
+        raw = os.environ.get("REACT_CONTROLLER_REPAIR_MAX_OUTPUT_TOKENS")
+        if raw is not None:
+            try:
+                return max(700, int(str(raw).strip()))
+            except Exception:
+                pass
+        return 1800
+
     def _get_llm_handle(self, temperature: float) -> ReactLLMHandle:
         t = float(temperature)
-        key = f"{t:.2f}"
+        thinking_key = str(self.default_thinking_level or "none")
+        key = f"{t:.2f}:{thinking_key}:{int(self.default_max_output_tokens)}"
         h = self._handles.get(key)
         if h is not None:
             return h
         h = create_react_llm(
             purpose="controller_repair",
-            thinking_level="low",
+            thinking_level=self.default_thinking_level,
             include_thoughts=False,
             temperature=t,
-            max_output_tokens=900,
+            max_output_tokens=int(self.default_max_output_tokens),
         )
         self._handles[key] = h
         return h
@@ -115,16 +143,60 @@ class ControllerRepairGenerator:
         auto_rewrite: Optional[Dict[str, Any]] = None,
         context_xml: str,
         conversation_context: Optional[Dict[str, Any]] = None,
+        structured_generation_guidance: Optional[Dict[str, Any]] = None,
+        repair_context: Optional[Dict[str, Any]] = None,
         current_sql: str,
         temperature: Optional[float] = None,
         react_run_id: Optional[str] = None,
     ) -> Tuple[Optional[str], str]:
+        sql, mode, _meta = await self.generate_with_plan(
+            question=question,
+            generation_mode=generation_mode,
+            inner_dbms=inner_dbms,
+            datasource=datasource,
+            missing_requirements=missing_requirements,
+            failed_checks=failed_checks,
+            passed_must_ids=passed_must_ids,
+            suggested_fixes=suggested_fixes,
+            auto_rewrite=auto_rewrite,
+            context_xml=context_xml,
+            conversation_context=conversation_context,
+            structured_generation_guidance=structured_generation_guidance,
+            repair_context=repair_context,
+            current_sql=current_sql,
+            temperature=temperature,
+            react_run_id=react_run_id,
+        )
+        return sql, mode
+
+    async def generate_with_plan(
+        self,
+        *,
+        question: str,
+        generation_mode: Optional[str] = None,
+        inner_dbms: Optional[str] = None,
+        datasource: Optional[str] = None,
+        # Backward compatible: legacy string hints
+        missing_requirements: Optional[List[str]] = None,
+        # Preferred: structured rubric feedback + validate_sql hints
+        failed_checks: Optional[List[Dict[str, Any]]] = None,
+        passed_must_ids: Optional[List[str]] = None,
+        suggested_fixes: Optional[List[str]] = None,
+        auto_rewrite: Optional[Dict[str, Any]] = None,
+        context_xml: str,
+        conversation_context: Optional[Dict[str, Any]] = None,
+        structured_generation_guidance: Optional[Dict[str, Any]] = None,
+        repair_context: Optional[Dict[str, Any]] = None,
+        current_sql: str,
+        temperature: Optional[float] = None,
+        react_run_id: Optional[str] = None,
+    ) -> Tuple[Optional[str], str, Dict[str, Any]]:
         q = (question or "").strip()
         if not q:
-            return None, "empty_question"
+            return None, "empty_question", {}
         cur = (current_sql or "").strip()
         if not cur:
-            return None, "empty_sql"
+            return None, "empty_sql", {}
         miss = [str(x or "").strip() for x in (missing_requirements or []) if str(x or "").strip()]
         t = self.default_temperature if temperature is None else float(temperature)
         llm_handle = self._get_llm_handle(t)
@@ -148,8 +220,18 @@ class ControllerRepairGenerator:
             payload["datasource"] = str(datasource)
         if isinstance(conversation_context, dict) and conversation_context:
             payload["conversation_context"] = conversation_context
+        if isinstance(structured_generation_guidance, dict) and structured_generation_guidance:
+            payload["structured_generation_guidance"] = structured_generation_guidance
+        if isinstance(repair_context, dict) and repair_context:
+            payload["repair_context"] = repair_context
         human_text = json.dumps(payload, ensure_ascii=False)
-        messages = [SystemMessage(content=self.system_prompt), HumanMessage(content=human_text)]
+        system_prompt = render_passthrough_dialect_prompt(
+            self.system_prompt,
+            generation_mode=generation_mode,
+            inner_dbms=inner_dbms,
+        )
+        prompt_meta = PromptMeta(prompt_file=self._PROMPT_FILE, prompt_text=system_prompt)
+        messages = [SystemMessage(content=system_prompt), HumanMessage(content=human_text)]
         started = time.perf_counter()
         try:
             resp = await llm_handle.llm.ainvoke(messages)
@@ -162,9 +244,9 @@ class ControllerRepairGenerator:
                 generator="controller_repair_generator",
                 llm_provider=llm_handle.provider,
                 llm_model=llm_handle.model,
-                prompt=self.prompt_meta,
+                prompt=prompt_meta,
                 input_payload=payload,
-                messages_payload={"system": self.system_prompt, "human": human_text},
+                messages_payload={"system": system_prompt, "human": human_text},
                 mode="json_text",
                 elapsed_ms=None,
                 response_raw=None,
@@ -180,12 +262,34 @@ class ControllerRepairGenerator:
                 ),
                 max_inline_chars=0,
             )
-            return None, "llm_error"
+            return None, "llm_error", {}
         elapsed_ms = (time.perf_counter() - started) * 1000.0
 
         text = _content_to_text(getattr(resp, "content", ""))
+        response_meta: Dict[str, Any] = {}
+        try:
+            response_meta = {
+                "response_metadata": getattr(resp, "response_metadata", None),
+                "usage_metadata": getattr(resp, "usage_metadata", None),
+                "additional_kwargs": getattr(resp, "additional_kwargs", None),
+            }
+        except Exception:
+            response_meta = {}
         obj = _extract_first_json_object(text) or {}
         sql = str(obj.get("sql") or "").strip()
+        plan_raw = obj.get("repair_plan")
+        repair_plan: List[str] = []
+        if isinstance(plan_raw, list):
+            repair_plan = [str(x or "").strip()[:300] for x in plan_raw if str(x or "").strip()][:8]
+        elif isinstance(plan_raw, str) and plan_raw.strip():
+            repair_plan = [plan_raw.strip()[:300]]
+        issue_choice = str(obj.get("issue_choice") or "").strip()[:80]
+        regenerate_hint = str(obj.get("regenerate_hint") or "").strip()[:800]
+        meta: Dict[str, Any] = {
+            "issue_choice": issue_choice,
+            "repair_plan": repair_plan,
+            "regenerate_hint": regenerate_hint,
+        }
 
         SmartLogger.log(
             "INFO",
@@ -198,7 +302,11 @@ class ControllerRepairGenerator:
                     "ok": bool(sql),
                     "missing_n": len(miss),
                     "failed_checks_n": len(list(failed_checks or [])),
+                    "has_repair_plan": bool(repair_plan),
+                    "has_regenerate_hint": bool(regenerate_hint),
                     "temperature": float(t),
+                    "thinking_level": self.default_thinking_level or "",
+                    "max_output_tokens": int(self.default_max_output_tokens),
                 }
             ),
             max_inline_chars=0,
@@ -211,15 +319,20 @@ class ControllerRepairGenerator:
             generator="controller_repair_generator",
             llm_provider=llm_handle.provider,
             llm_model=llm_handle.model,
-            prompt=self.prompt_meta,
+            prompt=prompt_meta,
             input_payload=payload,
-            messages_payload={"system": self.system_prompt, "human": human_text},
+            messages_payload={"system": system_prompt, "human": human_text},
             mode="json_text",
             elapsed_ms=elapsed_ms,
             response_raw=text,
-            parsed={"sql": sql, "parsed_obj": obj},
+            parsed={"sql": sql, "repair_meta": meta, "parsed_obj": obj},
+            extra=response_meta,
         )
-        return (sql if sql else None), ("llm_ok" if sql else "llm_empty")
+        if sql:
+            return sql, "llm_ok", meta
+        if repair_plan or regenerate_hint:
+            return None, "llm_plan_only", meta
+        return None, "llm_empty", meta
 
 
 @lru_cache(maxsize=1)
