@@ -115,7 +115,7 @@ async def _run_repair_pipeline(
             steps["ensure_neo4j_schema"] = {"ok": False, "error": str(exc)}
 
         try:
-            await ensure_text_to_sql_table_vectors(session)
+            await ensure_text_to_sql_table_vectors(session, force=True)
             steps["ensure_text_to_sql_table_vectors"] = {"ok": True}
         except Exception as exc:
             steps["ensure_text_to_sql_table_vectors"] = {"ok": False, "error": str(exc)}

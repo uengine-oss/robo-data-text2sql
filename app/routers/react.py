@@ -503,6 +503,246 @@ class ReactRequest(BaseModel):
     )
 
 
+_E2E_FIXTURE_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def _e2e_cache_key(request: ReactRequest) -> str:
+    return json.dumps(
+        {
+            "question": _norm_ws_key(request.question),
+            "datasource": str(request.datasource or "").strip().lower(),
+            "schema_filter": request.schema_filter or [],
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
+
+def _e2e_completed_response(
+    request: ReactRequest,
+    *,
+    from_cache: bool = False,
+    empty_result: bool = False,
+    feedback_required: bool = False,
+) -> Dict[str, Any]:
+    rows = [] if empty_result else [[1, "sample-a", 120.5], [2, "sample-b", 80.0]]
+    sql = 'SELECT id, label, amount FROM sample.e2e_items ORDER BY id'
+    quality_gate = None
+    if feedback_required:
+        quality_gate = {
+            "policy": "e2e-fixture",
+            "threshold": 0.9,
+            "rounds": 1,
+            "ok": False,
+            "verified_confidence": 0.42,
+            "results": [
+                {
+                    "accept": False,
+                    "confidence": 0.42,
+                    "reasons": ["E2E fixture quality gate failure"],
+                    "risk_flags": ["fixture_low_confidence"],
+                    "summary": "Fixture marks this answer as requiring user feedback.",
+                }
+            ],
+            "error": None,
+        }
+    return {
+        "status": "completed",
+        "final_sql": sql,
+        "validated_sql": sql,
+        "execution_result": {
+            "columns": ["id", "label", "amount"],
+            "rows": rows,
+            "row_count": len(rows),
+            "execution_time_ms": 7.0,
+        },
+        "steps": [] if from_cache else [
+            {
+                "iteration": 1,
+                "reasoning": "E2E fixture generated a deterministic SQL candidate.",
+                "metadata_xml": "<metadata><datasource>e2e</datasource></metadata>",
+                "partial_sql": sql,
+                "sql_completeness": {
+                    "is_complete": True,
+                    "missing_info": "",
+                    "confidence_level": "high",
+                },
+                "tool_call": {
+                    "name": "validate_sql",
+                    "raw_parameters_xml": "<parameters/>",
+                    "parameters": {"sql": sql},
+                },
+                "tool_result": "<result verdict=\"PASS\" row_count=\"2\"/>",
+                "llm_output": "",
+            }
+        ],
+        "collected_metadata": "<metadata><tables><table name=\"e2e_items\"/></tables></metadata>",
+        "partial_sql": sql,
+        "remaining_tool_calls": max(0, int(request.max_tool_calls) - 3),
+        "session_state": None,
+        "conversation_state": f"e2e-conversation-{hashlib.sha1(_e2e_cache_key(request).encode('utf-8')).hexdigest()[:12]}",
+        "warnings": None,
+        "from_cache": from_cache,
+        "quality_gate": quality_gate,
+        "feedback_required": feedback_required,
+        "react_run_id": "react_e2e_fixture",
+        "prompt_snapshot_id": "prompt_e2e_fixture",
+    }
+
+
+def _e2e_line(event: Dict[str, Any]) -> str:
+    return json.dumps(event, ensure_ascii=False) + "\n"
+
+
+async def _e2e_event_iterator(request: ReactRequest, response: Dict[str, Any], *, cache_hit: bool = False):
+    if cache_hit:
+        yield _e2e_line({"event": "cache_hit", "message": "캐시된 결과를 반환합니다", "hit_count": 1})
+        yield _e2e_line({"event": "completed", "response": response, "state": {"remaining_tool_calls": 0}})
+        return
+
+    yield _e2e_line({
+        "event": "pipeline_stage",
+        "pipeline": "build_sql_context",
+        "stage": "embedding",
+        "status": "start",
+        "seq": 1,
+        "iteration": 0,
+        "ts_ms": int(time.time() * 1000),
+    })
+    yield _e2e_line({
+        "event": "pipeline_stage",
+        "pipeline": "build_sql_context",
+        "stage": "embedding",
+        "status": "done",
+        "seq": 1,
+        "iteration": 0,
+        "ts_ms": int(time.time() * 1000),
+        "elapsed_ms": 5,
+        "counts": {"table_candidates": 1, "selected_tables": 1},
+    })
+    yield _e2e_line({"event": "prefetch", "tool_name": "build_sql_context", "elapsed_ms": 6, "remaining_tool_calls": 27})
+    yield _e2e_line({
+        "event": "pipeline_stage",
+        "pipeline": "controller",
+        "stage": "controller_validate",
+        "status": "start",
+        "seq": 2,
+        "iteration": 1,
+        "ts_ms": int(time.time() * 1000),
+    })
+    await asyncio.sleep(0.8)
+    yield _e2e_line({
+        "event": "pipeline_item",
+        "pipeline": "controller",
+        "stage": "controller_validate",
+        "item_type": "candidate",
+        "iteration": 1,
+        "index": 1,
+        "total": 2,
+        "verdict": "PASS",
+        "row_count": response["execution_result"]["row_count"],
+        "elapsed_ms": 4,
+        "ts_ms": int(time.time() * 1000),
+    })
+    yield _e2e_line({"event": "step", "step": response["steps"][0], "state": {"partial_sql": response["partial_sql"]}})
+    yield _e2e_line({"event": "completed", "response": response, "state": {"remaining_tool_calls": response["remaining_tool_calls"]}})
+
+
+def _e2e_fixture_response(request: ReactRequest) -> Optional[StreamingResponse]:
+    if not bool(getattr(settings, "text2sql_e2e_fixture_mode", False)):
+        return None
+
+    q = _norm_ws_key(request.question)
+    if request.session_state == "e2e-step-confirmation" and request.step_confirmation_response != "continue":
+        raise HTTPException(status_code=400, detail="Step confirmation response required to continue.")
+
+    if "budget-error" in q or int(request.max_tool_calls) <= 1:
+        async def _err_iter():
+            yield _e2e_line({"event": "error", "message": "도구 호출 예산이 부족합니다."})
+        return StreamingResponse(_err_iter(), media_type="application/x-ndjson")
+
+    if "needs-input" in q and not request.user_response:
+        async def _needs_input_iter():
+            response = {
+                "status": "needs_user_input",
+                "final_sql": None,
+                "validated_sql": None,
+                "execution_result": None,
+                "steps": [],
+                "collected_metadata": "",
+                "partial_sql": "",
+                "remaining_tool_calls": 20,
+                "question_to_user": "어떤 기준으로 결과를 좁힐까요?",
+                "session_state": "e2e-needs-input",
+                "conversation_state": None,
+                "warnings": [],
+                "from_cache": False,
+                "quality_gate": None,
+                "feedback_required": False,
+            }
+            yield _e2e_line({"event": "needs_user_input", "response": response, "state": {"remaining_tool_calls": 20}})
+        return StreamingResponse(_needs_input_iter(), media_type="application/x-ndjson")
+
+    if request.step_confirmation_mode and request.step_confirmation_response != "continue":
+        async def _step_confirmation_iter():
+            response = {
+                "status": "await_step_confirmation",
+                "final_sql": None,
+                "validated_sql": None,
+                "execution_result": None,
+                "steps": [],
+                "collected_metadata": "",
+                "partial_sql": "",
+                "remaining_tool_calls": 20,
+                "question_to_user": "다음 단계로 진행할까요?",
+                "session_state": "e2e-step-confirmation",
+                "conversation_state": None,
+                "warnings": [],
+                "from_cache": False,
+                "quality_gate": None,
+                "feedback_required": False,
+            }
+            yield _e2e_line({"event": "step_confirmation", "response": response, "state": {"remaining_tool_calls": 20}})
+        return StreamingResponse(_step_confirmation_iter(), media_type="application/x-ndjson")
+
+    if "stream-error" in q:
+        async def _stream_error_iter():
+            yield _e2e_line({
+                "event": "pipeline_stage",
+                "pipeline": "controller",
+                "stage": "controller_validate",
+                "status": "start",
+                "seq": 1,
+                "iteration": 1,
+                "ts_ms": int(time.time() * 1000),
+            })
+            yield _e2e_line({"event": "error", "message": "E2E fixture stream error"})
+        return StreamingResponse(_stream_error_iter(), media_type="application/x-ndjson")
+
+    key = _e2e_cache_key(request)
+    cache_allowed = request.use_cache and not request.session_state and not request.user_response and not request.conversation_state
+    if cache_allowed and key in _E2E_FIXTURE_CACHE:
+        cached_response = dict(_E2E_FIXTURE_CACHE[key])
+        cached_response["from_cache"] = True
+        cached_response["steps"] = []
+        cached_response["feedback_required"] = False
+        cached_response["quality_gate"] = None
+        return StreamingResponse(
+            _e2e_event_iterator(request, cached_response, cache_hit=True),
+            media_type="text/event-stream",
+            headers={"X-Cache-Hit": "true"},
+        )
+
+    response = _e2e_completed_response(
+        request,
+        empty_result=("empty-result" in q),
+        feedback_required=("quality-fail" in q),
+    )
+    if cache_allowed:
+        _E2E_FIXTURE_CACHE[key] = dict(response)
+    return StreamingResponse(_e2e_event_iterator(request, response), media_type="application/x-ndjson")
+
+
 def _preview_for_query_quality_gate(
     execution_result: Optional[ExecutionResultModel],
     *,
@@ -741,6 +981,10 @@ async def run_react(
     runtime_repair_status = "unknown"
     runtime_repair_check: Optional[Dict[str, Any]] = None
     cold_start_blocking_needed = False
+
+    e2e_fixture = _e2e_fixture_response(request)
+    if e2e_fixture is not None:
+        return e2e_fixture
 
     # Runtime self-heal trigger (throttled):
     # If graph was reinitialized while server is already running, newly created Table/Column nodes

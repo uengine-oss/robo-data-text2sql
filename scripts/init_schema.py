@@ -23,12 +23,10 @@ async def init_schema():
     queries = [
         # Constraints
         """
-        CREATE CONSTRAINT table_key IF NOT EXISTS
-        FOR (t:Table) REQUIRE (t.db, t.schema, t.name) IS NODE KEY
+        CREATE CONSTRAINT table_unique IF NOT EXISTS FOR (n:Table) REQUIRE (n.db, n.schema, n.name) IS UNIQUE
         """,
         """
-        CREATE CONSTRAINT column_fqn IF NOT EXISTS
-        FOR (c:Column) REQUIRE c.fqn IS UNIQUE
+        CREATE CONSTRAINT column_unique IF NOT EXISTS FOR (n:Column) REQUIRE (n.fqn) IS UNIQUE
         """,
         # Regular indexes
         """

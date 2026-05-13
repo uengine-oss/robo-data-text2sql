@@ -256,6 +256,81 @@ async def _llm_profile_for_table(
     return obj
 
 
+def _fallback_profile_for_table(
+    *,
+    item: _TableItem,
+    sample_rows: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Build a deterministic table profile from schema metadata.
+
+    This keeps retrieval usable when the LLM profiler is unavailable or returns
+    an empty profile. The embedding client still provides the semantic vector.
+    """
+    columns = list(item.columns or [])
+    column_lines: List[str] = []
+    column_names: List[str] = []
+    value_signatures: List[str] = []
+
+    for col in columns[:80]:
+        name = str(col.get("name") or "").strip()
+        if not name:
+            continue
+        dtype = str(col.get("dtype") or "").strip()
+        desc = str(col.get("description") or "").strip()
+        column_names.append(name)
+        line = name
+        if dtype:
+            line += f" ({dtype})"
+        if desc:
+            line += f": {desc}"
+        column_lines.append(line)
+
+    for row in (sample_rows or [])[:3]:
+        if not isinstance(row, dict):
+            continue
+        parts: List[str] = []
+        for key, value in list(row.items())[:12]:
+            value_s = str(_truncate_value(value, max_len=50) or "").strip()
+            if value_s:
+                parts.append(f"{key}={value_s}")
+        if parts:
+            value_signatures.append(", ".join(parts))
+
+    summary_parts = [
+        f"Table {item.fqn}",
+        str(item.description or "").strip(),
+        str(item.analyzed_description or "").strip(),
+    ]
+    summary = " | ".join([p for p in summary_parts if p])
+    if not summary:
+        summary = f"Table {item.fqn}"
+
+    text_parts = [
+        f"schema: {item.schema}",
+        f"table: {item.name}",
+        f"fully qualified name: {item.fqn}",
+        f"description: {item.description}",
+        f"analyzed description: {item.analyzed_description}",
+        "columns:",
+        "\n".join(column_lines[:80]),
+    ]
+    if value_signatures:
+        text_parts.extend(["sample values:", "\n".join(value_signatures)])
+
+    embedding_text = "\n".join([str(p).strip() for p in text_parts if str(p or "").strip()])
+
+    return {
+        "entity_type_guess": "",
+        "one_line_summary": _truncate(summary, 240),
+        "filters_users_might_use": column_names[:20],
+        "value_signatures": value_signatures[:6],
+        "search_keywords_ko": column_names[:25],
+        "embedding_text": _truncate(embedding_text, 8000),
+        "profile_source": "metadata_fallback",
+    }
+
+
 async def _write_vectors_to_neo4j(
     neo4j_session,
     *,
@@ -276,12 +351,12 @@ async def _write_vectors_to_neo4j(
     await res.consume()
 
 
-async def ensure_text_to_sql_table_vectors(neo4j_session) -> None:
+async def ensure_text_to_sql_table_vectors(neo4j_session, *, force: bool = False) -> None:
     """
     Blocking startup job (called from main lifespan).
     Creates Table.text_to_sql_vector when missing.
     """
-    if not bool(getattr(settings, "text2sql_vectorize_on_startup", True)):
+    if not force and not bool(getattr(settings, "text2sql_vectorize_on_startup", True)):
         return
 
     started = time.perf_counter()
@@ -351,8 +426,10 @@ async def ensure_text_to_sql_table_vectors(neo4j_session) -> None:
     sem = asyncio.Semaphore(llm_conc)
     profiles: Dict[str, Dict[str, Any]] = {}
     embedding_texts: Dict[str, str] = {}
+    fallback_profile_count = 0
 
     async def _one(t: _TableItem) -> None:
+        nonlocal fallback_profile_count
         # sample rows
         samples: List[Dict[str, Any]] = []
         if db_pool is not None:
@@ -366,7 +443,8 @@ async def ensure_text_to_sql_table_vectors(neo4j_session) -> None:
         async with sem:
             prof = await _llm_profile_for_table(item=t, sample_rows=samples)
         if not prof:
-            return
+            prof = _fallback_profile_for_table(item=t, sample_rows=samples)
+            fallback_profile_count += 1
         profiles[t.tid] = prof
         embedding_texts[t.tid] = str(prof.get("embedding_text") or "").strip()
 
@@ -400,6 +478,7 @@ async def ensure_text_to_sql_table_vectors(neo4j_session) -> None:
             "filters_users_might_use": prof.get("filters_users_might_use", [])[:10],
             "value_signatures": prof.get("value_signatures", [])[:6],
             "search_keywords_ko": prof.get("search_keywords_ko", [])[:25],
+            "profile_source": prof.get("profile_source", "llm"),
         }
         payload.append(
             {
@@ -422,7 +501,13 @@ async def ensure_text_to_sql_table_vectors(neo4j_session) -> None:
         "INFO",
         "text2sql.table_vectorizer.done",
         category="text2sql.table_vectorizer",
-        params={"tables_missing": len(tables), "tables_profiled": len(profiles), "tables_updated": updated, "elapsed_ms": elapsed_ms},
+        params={
+            "tables_missing": len(tables),
+            "tables_profiled": len(profiles),
+            "tables_profiled_with_fallback": int(fallback_profile_count),
+            "tables_updated": updated,
+            "elapsed_ms": elapsed_ms,
+        },
     )
 
 

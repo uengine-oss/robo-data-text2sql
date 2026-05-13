@@ -29,8 +29,10 @@ class Settings(BaseSettings):
     neo4j_password: str = ""
     neo4j_database: str = "neo4j"
 
-    # Target Database endpoint (MindsDB MySQL protocol)
-    target_db_type: Literal["mysql", "mariadb"] = "mysql"
+    # Target Database endpoint:
+    # - mysql/mariadb: MindsDB MySQL protocol endpoint
+    # - postgres/postgresql: direct PostgreSQL via asyncpg
+    target_db_type: Literal["mysql", "mariadb", "postgres", "postgresql"] = "mysql"
     target_db_host: str = "localhost"
     target_db_port: int = 47335
     target_db_name: str = "mindsdb"
@@ -147,6 +149,7 @@ class Settings(BaseSettings):
     api_host: str = "0.0.0.0"
     api_port: int = 8000
     api_workers: int = 1
+    text2sql_e2e_fixture_mode: bool = False
     
     # Security & Limits
     sql_timeout_seconds: int = 30
