@@ -35,7 +35,10 @@ clean:
 	rm -rf .venv __pycache__ **/__pycache__
 
 test:
-	uv run pytest tests/ -v
+	# FR-003(spec 007 T0): 이전 경로 `tests/` 는 존재하지 않아 이 타깃이 항상 실패했다.
+	# PYTHONPATH=. 가 없으면 `app` 패키지를 찾지 못한다(pyproject 에 pytest 설정이 없다).
+	# 제외한 파일은 존재하지 않는 모듈을 import 하는 사전 파손 상태다(수집 단계에서 죽는다).
+	PYTHONPATH=. uv run pytest app/tests -v --ignore=app/tests/react/test_intent_keyword_json_parsing.py
 
 lint:
 	uv run ruff check app/

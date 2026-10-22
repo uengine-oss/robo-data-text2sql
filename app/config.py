@@ -44,8 +44,25 @@ class Settings(BaseSettings):
     llm_cache_path: str = ".cache/llm_cache.db"
 
     # Unified Embedding configuration
+    # Provider (spec 007 T1 / FR-020):
+    # - "openai"       : OpenAI 공식 엔드포인트 (기존 동작. 기본값을 바꾸지 않는 이유는
+    #                    되돌리기가 환경변수 한 줄이어야 하기 때문이다 — AD-8)
+    # - "llm_endpoint" : 사용자가 이미 돌리는 OpenAI 호환 서버의 /v1/embeddings 재사용
+    #                    (Ollama·LM Studio·vLLM). 우리 스택 메모리 증가 0 — AD-5 1순위
+    # - "local"        : 번들 로컬 모델. A2(분석기 /robo/embed) 이후에 열린다 — 지금은 "준비 중"
     embedding_provider: str = "openai"
     embedding_model: str = "text-embedding-3-small"
+    # OpenAI 호환 임베딩 엔드포인트. 비어 있으면 llm_provider_url 로 폴백한다.
+    # (사용자가 LLM 을 붙인 그 엔드포인트를 그대로 쓰는 것이 1순위이므로 폴백이 기본이다.)
+    embedding_provider_url: str = ""
+    # 임베딩 전용 자격증명. 비어 있으면 provider 별로 openai_compatible_api_key →
+    # openai_api_key 순으로 폴백한다. 로컬 서버는 키를 검사하지 않는 경우가 많아
+    # llm_endpoint 에서는 키가 없어도 진행한다(placeholder 를 넣는다).
+    embedding_api_key: str = ""
+    # `dimensions` 파라미터를 임베딩 요청에 실을지. MRL 모델(qwen3-embedding 등)과
+    # OpenAI text-embedding-3-* 는 이것으로 차원을 맞출 수 있어, **인덱스를 다시 만들지
+    # 않고** 제공자를 갈아탈 수 있다. 지원 안 하는 서버는 400 을 내므로 기본은 끔.
+    embedding_send_dimensions: bool = False
 
     # API keys (optional at settings-load time; validated at runtime by factories)
     openai_api_key: str = ""
@@ -122,8 +139,13 @@ class Settings(BaseSettings):
     max_fk_hops: int = 3
     embedding_dimension: int = 1536
 
-    # Text-to-SQL Table vectorization (startup-time, stored in Neo4j as Table.text_to_sql_vector)
-    text2sql_vectorize_on_startup: bool = True
+    # Text-to-SQL Table vectorization
+    # spec 007 T3 / FR-026 — 기동은 색인과 무관해야 한다.
+    # 기본값을 True -> False 로 바꿨다. 색인은 이제 메타데이터 추출의 단계다
+    # (`POST /text2sql/index/datasource`). 되돌리려면 이 값을 true 로,
+    # 옛 **블로킹** 동작까지 되살리려면 아래 _blocking 도 true 로 둔다.
+    text2sql_vectorize_on_startup: bool = False
+    text2sql_vectorize_on_startup_blocking: bool = False
     text2sql_vector_sample_rows: int = 10
     text2sql_vector_db_timeout_seconds: float = 2.0
     text2sql_vector_llm_concurrency: int = 30
@@ -159,6 +181,11 @@ class Settings(BaseSettings):
     text2sql_runtime_repair_enabled: bool = True
     text2sql_runtime_repair_check_interval_s: float = 30.0
     text2sql_runtime_repair_min_missing_to_trigger: int = 1
+
+    # 색인 게이트 (spec 007 T4 / FR-031)
+    # `unindexed`/`stale` 에서 데이터소스 자연어 질의를 거부한다.
+    # 되돌리기: false 로 두면 색인 상태와 무관하게 이전처럼 진행한다.
+    text2sql_index_gate_enabled: bool = True
 
     # HyDE retrieval (build_sql_context) - single HyDE only
     # NOTE: Used for ALL retrieval axes (HyDE/question/regex/intent/PRF) candidate prefetch.
@@ -199,6 +226,20 @@ class Settings(BaseSettings):
     # build_sql_context - light disambiguation query generation
     # Number of lightweight SQL queries to generate (and preview) to help resolve ambiguities.
     build_sql_context_light_query_count: int = 3
+
+    # ----------------------------------------------------------------------------
+    # 기동 sanity check 정책 (spec 007 T3 / SC-001)
+    # ----------------------------------------------------------------------------
+    # 이전 판은 네 검사 중 **하나라도** 실패하면 RuntimeError 로 서버를 안 띄웠고,
+    # `embedding_provider` 기본값이 openai 라서 LLM 을 google 로 쓰는 사용자도
+    # OPENAI_API_KEY 가 없으면 기동이 실패했다 (CR-5b 결과 3 — 데스크톱 크래시 루프).
+    #
+    # "뜨는 것"과 "질의가 되는 것"은 다른 문제다 (AD-4 규칙 3). 그래서 인프라 검사
+    # (neo4j·target_db)만 치명으로 남기고, LLM/임베딩 검사는 **경고**로 강등한다.
+    # 질의가 되는지는 색인 상태(FR-030)가 판정하고 사용자에게 이유와 함께 알린다.
+    #
+    # 되돌리기: STARTUP_SANITY_STRICT=true 로 두면 이전과 똑같이 전부 치명이 된다.
+    startup_sanity_strict: bool = False
 
     # Logging
     log_level: str = "INFO"

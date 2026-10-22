@@ -30,6 +30,10 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
 
+# One SQL identifier: bare, backtick-quoted, or double-quoted.
+_IDENTIFIER = r'(?:`[^`]+`|"[^"]+"|[A-Za-z_][A-Za-z0-9_$]*)'
+
+
 @dataclass(frozen=True)
 class MindsDBPrepareResult:
     sql: str
@@ -136,10 +140,32 @@ def _mysql_to_postgres_sql(sql: str, datasource: str) -> str:
 
     tmp = re.sub(r"'(?:[^']|'')*'", _protect_str, inner)
 
-    # Remove datasource prefix at identifier boundaries:
-    # postgresql.`RWIS`... / postgresql."RWIS"... / postgresql.RWIS...
+    # Remove the datasource prefix at identifier boundaries, but ONLY from a
+    # fully-qualified three-part reference:
+    #     postgresql.`RWIS`.`TB` / postgresql."RWIS"."TB" / postgresql.RWIS.TB
+    #
+    # A two-part `<ds>.<name>` is deliberately left alone. It is ambiguous, and
+    # reading it as a datasource prefix is wrong whenever the datasource and the
+    # schema share a name -- `legacy.tb09` (ds=legacy) or
+    # `manufacturing.mfg_daily_equipment` (ds=manufacturing). Stripping there
+    # destroys the schema qualifier and PostgreSQL answers
+    # `relation "tb09" does not exist`, which reads like a missing table rather
+    # than a mangled query.
+    #
+    # Leaving it intact is correct for both engines because passthrough sends the
+    # inner SQL to the source verbatim: it is already a valid schema-qualified
+    # name in PostgreSQL and a valid database-qualified one in MySQL.
+    #
+    # The datasource itself may arrive quoted (`ds`.`schema`.`table`); this runs
+    # before backticks are rewritten, so all three spellings are matched here.
     if ds:
-        tmp = re.sub(rf"(?i)\b{re.escape(ds)}\s*\.", "", tmp)
+        escaped = re.escape(ds)
+        ds_prefix = rf'(?:`{escaped}`|"{escaped}"|\b{escaped}\b)'
+        tmp = re.sub(
+            rf"(?i){ds_prefix}\s*\.\s*({_IDENTIFIER})\s*\.\s*({_IDENTIFIER})",
+            r"\1.\2",
+            tmp,
+        )
 
     # Step 1: Backtick-quoted function names (followed by '(') -> remove backticks only.
     # e.g. `SUBSTR`(...) -> SUBSTR(...)
@@ -219,6 +245,18 @@ def prepare_sql_for_mindsdb(sql: str, datasource: str) -> MindsDBPrepareResult:
         return MindsDBPrepareResult(sql=s, changed=False, reason="empty_sql", details={})
     if not ds:
         return MindsDBPrepareResult(sql=s, changed=False, reason="missing_datasource", details={})
+
+    # `mindsdb` is the project itself, not an external datasource. Passthrough
+    # hands the inner SQL to an external engine, so wrapping here would ask
+    # MindsDB to proxy into itself: it then rejects the two-part `mindsdb.<view>`
+    # with "project database support only single-part names". Views built over
+    # other datasources — including federated ones — are addressed this way, so
+    # they must be sent through untouched.
+    if ds.lower() == "mindsdb":
+        return MindsDBPrepareResult(
+            sql=s, changed=False, reason="mindsdb_project_not_passthrough",
+            details={"datasource": ds},
+        )
 
     if is_passthrough_query(s, ds):
         fixed = fix_passthrough_query_if_needed(s, ds)

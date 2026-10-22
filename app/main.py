@@ -2,6 +2,8 @@
 from dotenv import load_dotenv
 load_dotenv()
 
+import asyncio
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
@@ -68,18 +70,56 @@ async def lifespan(app: FastAPI):
                     max_inline_chars=0,
                 )
 
-            # Blocking startup: ensure Text-to-SQL table vectors exist.
-            try:
-                await ensure_text_to_sql_table_vectors(session)
-                print("Text-to-SQL table vectors ensured")
-            except Exception as e:
-                print(f"Text-to-SQL table vectors warning: {e}")
-                SmartLogger.log(
-                    "WARNING",
-                    "main.lifespan.text2sql_vectors.warning",
-                    category="main.lifespan.start",
-                    params={"error": str(e)},
-                    max_inline_chars=0,
+            # ----------------------------------------------------------------
+            # spec 007 T3 / FR-026 — 기동은 색인과 무관해야 한다.
+            #
+            # 이전 판은 여기서 `ensure_text_to_sql_table_vectors` 를 **블로킹**으로
+            # 돌렸다. 그 잡은 테이블마다 LLM 프로필 + 임베딩을 요구하므로 키가 없으면
+            # 기동 자체가 늦어지거나 실패했고, 그것이 데스크톱 크래시 루프의 한 축이었다.
+            # 색인은 이제 메타데이터 추출의 단계다 (`POST /text2sql/index/datasource`).
+            #
+            # 되돌리기: TEXT2SQL_VECTORIZE_ON_STARTUP=true 로 기동 잡을 다시 켜고,
+            #           TEXT2SQL_VECTORIZE_ON_STARTUP_BLOCKING=true 로 옛 블로킹 동작까지
+            #           복원한다. 기본값만 바뀌었을 뿐 코드 경로는 그대로 남아 있다.
+            # ----------------------------------------------------------------
+            if bool(getattr(settings, "text2sql_vectorize_on_startup", False)):
+                blocking = bool(getattr(settings, "text2sql_vectorize_on_startup_blocking", False))
+                if blocking:
+                    try:
+                        await ensure_text_to_sql_table_vectors(session)
+                        print("Text-to-SQL table vectors ensured (blocking, legacy mode)")
+                    except Exception as e:
+                        print(f"Text-to-SQL table vectors warning: {e}")
+                        SmartLogger.log(
+                            "WARNING",
+                            "main.lifespan.text2sql_vectors.warning",
+                            category="main.lifespan.start",
+                            params={"error": str(e)},
+                            max_inline_chars=0,
+                        )
+                else:
+                    # 비블로킹: 기동을 막지 않는다. 실패해도 서비스는 뜬다.
+                    async def _bg_vectorize() -> None:
+                        bg_session = await neo4j_conn.get_session()
+                        try:
+                            await ensure_text_to_sql_table_vectors(bg_session)
+                        except Exception as e:
+                            SmartLogger.log(
+                                "WARNING",
+                                "main.lifespan.text2sql_vectors.background_warning",
+                                category="main.lifespan.start",
+                                params={"error": str(e)},
+                                max_inline_chars=0,
+                            )
+                        finally:
+                            await bg_session.close()
+
+                    asyncio.create_task(_bg_vectorize())
+                    print("Text-to-SQL table vectors: background job started (non-blocking)")
+            else:
+                print(
+                    "Text-to-SQL table vectors: startup job disabled "
+                    "(색인은 메타데이터 추출 단계에서 수행됩니다 — POST /text2sql/index/datasource)"
                 )
 
             db_type = str(getattr(settings, "target_db_type", "") or "").strip().lower()
@@ -282,6 +322,10 @@ app.include_router(cache.router, prefix="/text2sql")
 
 # Include direct SQL router
 app.include_router(direct_sql.router, prefix="/text2sql")
+
+# 색인 API (spec 007 T3·T4). 추출 파이프라인이 부르고 UI 가 상태를 읽는다.
+from app.routers import indexing
+app.include_router(indexing.router, prefix="/text2sql")
 
 # Include events router for event detection and actions
 from app.routers import events

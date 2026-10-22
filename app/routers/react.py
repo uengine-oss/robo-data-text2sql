@@ -853,7 +853,79 @@ async def run_react(
                 media_type="text/event-stream",
                 headers={"X-Cache-Hit": "true"}
             )
-    
+
+    # ------------------------------------------------------------------
+    # 색인 게이트 (spec 007 T4 / FR-031~FR-033, AD-4)
+    #
+    # `unindexed`/`stale` 에서는 **답을 만들지 않고 거부한다.** 벡터축을 뺀 채로
+    # 답을 내면 사용자가 검증할 수 없는 나쁜 답이 나온다 — 거부는 검증할 필요가 없다.
+    #
+    # 자리가 여기인 이유:
+    #  - 캐시 조회(위)를 통과한 **뒤**다. 이미 검증된 캐시 답까지 막지 않는다.
+    #  - `_ensure_state_from_request`/`ToolContext` **앞**이다. 그래서
+    #    `app/react/controller.py` 는 물론 도구 컨텍스트도 만들어지지 않는다.
+    #    T1~T4 는 컨트롤러를 한 줄도 건드리지 않는다는 설계를 코드 배치로 지킨다.
+    #
+    # 되돌리기: TEXT2SQL_INDEX_GATE_ENABLED=false (설정 한 줄).
+    # ------------------------------------------------------------------
+    if bool(getattr(settings, "text2sql_index_gate_enabled", True)):
+        from app.core import index_status as _istat
+
+        _idx = await _istat.get_index_status(neo4j_session, request.datasource)
+        if not _idx.get("query_allowed"):
+            _rej = _istat.rejection_payload(_idx)
+
+            async def index_gate_iterator():
+                # 1) 사유 이벤트. 기존 진행상황 이벤트 이름을 재사용한다 —
+                #    새 이벤트 이름을 만들면 소비자(스튜디오·게이트웨이)가 모른다(FR-072).
+                yield json.dumps(
+                    {
+                        "event": "pipeline_stage",
+                        "pipeline": "index_gate",
+                        "stage": "datasource_index_check",
+                        "status": "error",
+                        "notes": [_idx.get("status"), _idx.get("reason") or ""],
+                        "detail": _rej,
+                    },
+                    ensure_ascii=False,
+                ) + "\n"
+                # 2) 소비자가 실제로 읽는 이벤트로도 낸다. 스튜디오는 `error` 를 읽고,
+                #    읽지 않는 소비자를 위해 `completed` 도 함께 보낸다 — 둘 중 하나만
+                #    보내면 한쪽 소비자에게는 "이유 없이 끝남"으로 보인다.
+                yield json.dumps(
+                    {"event": "error", "message": _rej["message"], "detail": _rej},
+                    ensure_ascii=False,
+                ) + "\n"
+                yield json.dumps(
+                    {
+                        "event": "completed",
+                        "response": {
+                            "status": "completed",
+                            "final_sql": "",
+                            "execution_result": None,
+                            "answer": _rej["message"],
+                            "warnings": [_rej["message"]],
+                            "index_status": _idx.get("status"),
+                            "steps": [],
+                        },
+                        "state": None,
+                    },
+                    ensure_ascii=False,
+                ) + "\n"
+
+            SmartLogger.log(
+                "WARNING",
+                "react.api.index_gate.rejected",
+                category="react.api.request",
+                params={"datasource": request.datasource, "index_status": _idx.get("status"), "reason": _idx.get("reason")},
+                max_inline_chars=0,
+            )
+            return StreamingResponse(
+                index_gate_iterator(),
+                media_type="application/x-ndjson",
+                headers={"X-Index-Status": str(_idx.get("status") or "")},
+            )
+
     state = _ensure_state_from_request(request)
 
     tool_context = ToolContext(
